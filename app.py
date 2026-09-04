@@ -1,7 +1,7 @@
 """
 EthioVoice AI — Voice & Text Telecom Assistant
-Now powered by Gemini (with automatic model-selection fallback), with local
-fuzzy-matching fallback if no Gemini model is reachable.
+Now powered by Gemini multimodal audio processing (with automatic model-selection fallback),
+plus local fuzzy-matching fallback if no Gemini model is reachable.
 Run with: streamlit run app.py
 """
 
@@ -13,16 +13,10 @@ import json
 import difflib
 from datetime import datetime
 
-# Optional real browser microphone input (Web Speech API via streamlit-mic-recorder)
-try:
-    from streamlit_mic_recorder import speech_to_text
-    MIC_AVAILABLE = True
-except ImportError:
-    MIC_AVAILABLE = False
-
 # Gemini SDK
 try:
     import google.generativeai as genai
+    from google.generativeai.types import Part
     GEMINI_SDK_AVAILABLE = True
 except ImportError:
     GEMINI_SDK_AVAILABLE = False
@@ -90,8 +84,7 @@ defaults = {
     "last_audio_hash": None,
     "prefill_phone": "",
     "prefill_amount": "",
-    # Caches whichever Gemini model most recently answered successfully, so we
-    # don't have to re-probe every candidate on every single command.
+    # Caches whichever Gemini model most recently answered successfully.
     "gemini_working_model": None,
 }
 for key, val in defaults.items():
@@ -108,14 +101,12 @@ def get_gemini_api_key():
         if "GEMINI_API_KEY" in st.secrets:
             return st.secrets["GEMINI_API_KEY"]
     except Exception:
-        pass  # st.secrets not configured — that's fine, fall through
+        pass
     return os.environ.get("GEMINI_API_KEY", "")
 
 
-# Ordered list of model names to try. The API version / model catalog served
-# to a given key can change (e.g. "gemini-1.5-flash" returning a 404 under
-# v1beta), so we try newer names first and step down through older ones.
-GEMINI_MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-pro"]
+# Modern valid model identifiers – try flash first, then pro.
+GEMINI_MODEL_CANDIDATES = ["gemini-1.5-flash", "gemini-1.5-pro"]
 
 GEMINI_API_KEY = get_gemini_api_key()
 GEMINI_READY = bool(GEMINI_API_KEY) and GEMINI_SDK_AVAILABLE
@@ -124,13 +115,15 @@ if GEMINI_READY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
     except Exception:
-        # If configuration itself fails, treat Gemini as unavailable so we
-        # cleanly drop straight to the local fallback NLU.
         GEMINI_READY = False
 
-GEMINI_SYSTEM_PROMPT = """You are the NLU engine for "EthioVoice AI", a voice assistant for Ethio Telecom and Telebirr users who speak Amharic (including slang, typos, and non-standard spelling).
+# ------------------------------------------------------------------
+# Gemini NLU prompt for text input (includes GREETING intent now)
+# ------------------------------------------------------------------
+GEMINI_TEXT_PROMPT = """You are the NLU engine for "EthioVoice AI", a voice assistant for Ethio Telecom and Telebirr users who speak Amharic (including slang, typos, and non-standard spelling).
 
 Classify the user's message into EXACTLY one of these intents:
+- "GREETING": user says hello, hi, selam, or any friendly greeting
 - "CHECK_BALANCE": user wants to check airtime, data, minutes, or SMS balance (like dialing *804#)
 - "BUY_PACKAGE": user wants to buy an internet/data or voice/combo package
 - "TRANSFER_TELEBIRR": user wants to send money via Telebirr
@@ -143,36 +136,47 @@ Also extract any relevant parameters mentioned, such as:
 
 Respond ONLY with valid JSON in this exact shape, with no extra text, no markdown fences:
 {
-  "intent": "CHECK_BALANCE | BUY_PACKAGE | TRANSFER_TELEBIRR | UNKNOWN",
+  "intent": "GREETING | CHECK_BALANCE | BUY_PACKAGE | TRANSFER_TELEBIRR | UNKNOWN",
   "parameters": {
     "package_type": "string or null",
     "amount": "number or null",
     "phone_number": "string or null"
   },
-  "response_amharic": "A short, polite, natural Amharic sentence confirming what you understood, or asking a polite clarifying question if the intent is UNKNOWN."
+  "response_amharic": "A short, polite, natural Amharic sentence confirming what you understood, or asking a polite clarifying question if the intent is UNKNOWN. For GREETING, respond with: 'ሰላም! እንኳን ወደ EthioVoice AI በደህና መጡ። የኢትዮ ቴሌኮም እና የቴሌብር አገልግሎቶችን ለመጠቀም 'ቀሪ ሂሳብ'፣ 'ፓኬጅ መግዛት' ወይም 'ገንዘብ መላክ' ብለው ይናገሩ ወይም ይፃፉ።'"
 }
 
 Always respond in valid JSON only. Never include commentary outside the JSON object.
 """
 
+# ------------------------------------------------------------------
+# Gemini multimodal prompt for audio input
+# ------------------------------------------------------------------
+GEMINI_AUDIO_PROMPT = """Listen to this Amharic audio recording carefully.
+First, transcribe exactly what the user said in Amharic text.
+Second, classify the intent into 'GREETING', 'CHECK_BALANCE', 'BUY_PACKAGE', 'TRANSFER_TELEBIRR', or 'UNKNOWN'.
+Respond in structured JSON containing:
+{
+  "transcription": "exact Amharic transcription",
+  "intent": "GREETING | CHECK_BALANCE | BUY_PACKAGE | TRANSFER_TELEBIRR | UNKNOWN",
+  "amharic_response": "A short, polite, natural Amharic sentence confirming what you understood, or asking a clarifying question. For GREETING, use: 'ሰላም! እንኳን ወደ EthioVoice AI በደህና መጡ። የኢትዮ ቴሌኮም እና የቴሌብር አገልግሎቶችን ለመጠቀም 'ቀሪ ሂሳብ'፣ 'ፓኬጅ መግዛት' ወይም 'ገንዘብ መላክ' ብለው ይናገሩ ወይም ይፃፉ።'"
+}
+Return only JSON, no markdown fences.
+"""
+
 
 def _build_model_order():
-    """
-    Return the candidate model list, with whichever model last answered
-    successfully (if any) moved to the front so we don't re-probe stale
-    404s on every command.
-    """
+    """Candidate list with last successful model moved to front."""
     working = st.session_state.get("gemini_working_model")
     if working and working in GEMINI_MODEL_CANDIDATES:
         return [working] + [m for m in GEMINI_MODEL_CANDIDATES if m != working]
     return list(GEMINI_MODEL_CANDIDATES)
 
 
-def _call_gemini_model(model_name, user_text):
-    """Make a single attempt against one specific Gemini model name. Raises on failure."""
+def _call_gemini_text_model(model_name, user_text):
+    """Text‑only NLU call. Raises on failure."""
     model = genai.GenerativeModel(
         model_name=model_name,
-        system_instruction=GEMINI_SYSTEM_PROMPT,
+        system_instruction=GEMINI_TEXT_PROMPT,
     )
     result = model.generate_content(
         user_text,
@@ -181,20 +185,14 @@ def _call_gemini_model(model_name, user_text):
             "response_mime_type": "application/json",
         },
     )
-
     raw_text = result.text.strip()
-    # Defensive cleanup in case the model wraps output in markdown fences anyway
     raw_text = re.sub(r"^```(json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
-
     parsed = json.loads(raw_text)
-
     intent = str(parsed.get("intent", "UNKNOWN")).upper()
-    if intent not in ("CHECK_BALANCE", "BUY_PACKAGE", "TRANSFER_TELEBIRR", "UNKNOWN"):
+    if intent not in ("GREETING", "CHECK_BALANCE", "BUY_PACKAGE", "TRANSFER_TELEBIRR", "UNKNOWN"):
         intent = "UNKNOWN"
-
     params = parsed.get("parameters") or {}
     response_amharic = parsed.get("response_amharic") or ""
-
     return {
         "intent": intent,
         "parameters": {
@@ -208,37 +206,68 @@ def _call_gemini_model(model_name, user_text):
     }
 
 
-def classify_intent_with_gemini(user_text):
-    """
-    Calls Gemini to classify intent, trying each candidate model in
-    GEMINI_MODEL_CANDIDATES order (last-known-working model first). If a
-    model name is unavailable for this API version/key (404, deprecated
-    name, etc.) — or fails for any other reason — it is skipped in favor of
-    the next candidate. Only after every candidate has failed is the error
-    raised, which lets the caller (understand_command) drop through to the
-    local fuzzy-matching fallback.
-    """
+def _call_gemini_audio_model(model_name, audio_bytes, mime_type="audio/wav"):
+    """Multimodal audio call. Returns dict with transcription, intent, response."""
+    model = genai.GenerativeModel(model_name=model_name)
+    audio_part = Part(mime_type=mime_type, data=audio_bytes)
+    result = model.generate_content(
+        [GEMINI_AUDIO_PROMPT, audio_part],
+        generation_config={
+            "temperature": 0.2,
+            "response_mime_type": "application/json",
+        },
+    )
+    raw_text = result.text.strip()
+    raw_text = re.sub(r"^```(json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
+    parsed = json.loads(raw_text)
+    transcription = parsed.get("transcription", "")
+    intent = str(parsed.get("intent", "UNKNOWN")).upper()
+    if intent not in ("GREETING", "CHECK_BALANCE", "BUY_PACKAGE", "TRANSFER_TELEBIRR", "UNKNOWN"):
+        intent = "UNKNOWN"
+    amharic_response = parsed.get("amharic_response", "")
+    return {
+        "transcription": transcription,
+        "intent": intent,
+        "response_amharic": amharic_response,
+        "source": "gemini_audio",
+        "model_used": model_name,
+    }
+
+
+def classify_intent_with_gemini_text(user_text):
+    """Try each text model in order, fallback locally on total failure."""
     last_error = None
     for model_name in _build_model_order():
         try:
-            output = _call_gemini_model(model_name, user_text)
+            output = _call_gemini_text_model(model_name, user_text)
             st.session_state.gemini_working_model = model_name
             return output
         except Exception as e:
             last_error = e
-            # If the model we thought was working just failed, stop trusting it.
             if st.session_state.get("gemini_working_model") == model_name:
                 st.session_state.gemini_working_model = None
-            # Whether this was a 404 (model not found / retired under this API
-            # version) or some other transient error, move on and try the
-            # next candidate model name.
             continue
-
-    # Every candidate model failed — bubble up the last error so the caller
-    # can fall back to local keyword matching.
-    if last_error is not None:
+    if last_error:
         raise last_error
-    raise RuntimeError("No Gemini model candidates were available to try.")
+    raise RuntimeError("No Gemini model candidates available.")
+
+
+def classify_audio_with_gemini(audio_bytes, mime_type="audio/wav"):
+    """Try each audio model in order, fallback locally if all fail."""
+    last_error = None
+    for model_name in _build_model_order():
+        try:
+            output = _call_gemini_audio_model(model_name, audio_bytes, mime_type)
+            st.session_state.gemini_working_model = model_name
+            return output
+        except Exception as e:
+            last_error = e
+            if st.session_state.get("gemini_working_model") == model_name:
+                st.session_state.gemini_working_model = None
+            continue
+    if last_error:
+        raise last_error
+    raise RuntimeError("No Gemini model candidates available.")
 
 
 # =========================================================
@@ -254,14 +283,24 @@ AMHARIC_NORMALIZATION_MAP = {
     "ፆ": "ጾ", "ፓኬጂ": "ፓኬጅ",
 }
 
+# GREETING added
 INTENT_KEYWORDS = {
+    "GREETING": ["ሰላም", "ሰላምታ", "ጤና ይስጥልኝ", "ሃይ", "hi", "hello", "hey", "ሄሎ"],
     "CHECK_BALANCE": ["ቀሪ", "ሂሳብ", "ሒሳብ", "ብር", "ስንት አለኝ", "ያለኝ", "balance", "804"],
     "BUY_PACKAGE": ["ፓኬጅ", "ፓኬጂ", "ጥቅል", "ኢንተርኔት", "ዳታ", "ደቂቃ",
                     "ሳምንታዊ", "ወርሃዊ", "package", "bundle"],
     "TRANSFER_TELEBIRR": ["ላክ", "መላክ", "ትራንስፈር", "ቴሌብር", "ገንዘብ", "send", "transfer"],
 }
 
+GREETING_RESPONSE = (
+    "ሰላም! እንኳን ወደ EthioVoice AI በደህና መጡ። "
+    "የኢትዮ ቴሌኮም እና የቴሌብር አገልግሎቶችን ለመጠቀም "
+    "'ቀሪ ሂሳብ'፣ 'ፓኬጅ መግዛት' ወይም 'ገንዘብ መላክ' "
+    "ብለው ይናገሩ ወይም ይፃፉ።"
+)
+
 FALLBACK_RESPONSES = {
+    "GREETING": GREETING_RESPONSE,
     "CHECK_BALANCE": "ቀሪ ሂሳብዎን እያሳየሁ ነው።",
     "BUY_PACKAGE": "ጥቅል ለመግዛት እየረዳሁዎት ነው። እባክዎ ከፓኬጅ ዝርዝር ትር ውስጥ ይምረጡ።",
     "TRANSFER_TELEBIRR": "ገንዘብ ለማስተላለፍ እየረዳሁዎት ነው። እባክዎ ዝርዝሮችን ያስገቡ።",
@@ -293,7 +332,7 @@ def keyword_matches(keyword, normalized_text, threshold=0.78):
 
 
 def classify_intent_locally(raw_text):
-    """Fallback NLU used when Gemini is unavailable or fails. Same output shape as Gemini path."""
+    """Local fallback NLU for text. Same output structure as Gemini text path."""
     normalized = normalize_text(raw_text)
     if not normalized:
         return {
@@ -310,13 +349,17 @@ def classify_intent_locally(raw_text):
         intent = matched[0]
         response = FALLBACK_RESPONSES[intent]
     elif len(matched) > 1:
-        intent = "UNKNOWN"
-        response = FALLBACK_RESPONSES["AMBIGUOUS"]
+        # If GREETING is among multiple, treat as greeting (more user friendly)
+        if "GREETING" in matched:
+            intent = "GREETING"
+            response = FALLBACK_RESPONSES["GREETING"]
+        else:
+            intent = "UNKNOWN"
+            response = FALLBACK_RESPONSES["AMBIGUOUS"]
     else:
         intent = "UNKNOWN"
         response = FALLBACK_RESPONSES["UNKNOWN"]
 
-    # Very light parameter extraction: grab a phone number and an amount if present
     phone_match = re.search(r"09\d{8}|9\d{8}", normalized)
     amount_match = re.search(r"\b(\d{2,6})\b", normalized)
 
@@ -334,9 +377,8 @@ def classify_intent_locally(raw_text):
 
 def understand_command(raw_text):
     """
-    Main NLU entry point. Tries Gemini first (looping through
-    GEMINI_MODEL_CANDIDATES if configured), falls back to local fuzzy
-    matching on any failure. Never raises — always returns a usable dict.
+    Main NLU entry point for text input.
+    Tries Gemini first (looping through candidates), falls back to local fuzzy matching.
     """
     if not raw_text or not raw_text.strip():
         return {
@@ -346,13 +388,37 @@ def understand_command(raw_text):
 
     if GEMINI_READY:
         try:
-            return classify_intent_with_gemini(raw_text)
+            return classify_intent_with_gemini_text(raw_text)
         except Exception as e:
             result = classify_intent_locally(raw_text)
             result["error"] = str(e)
             return result
     else:
         return classify_intent_locally(raw_text)
+
+
+def process_audio_command(audio_bytes, mime_type="audio/wav"):
+    """
+    Main NLU entry point for audio input.
+    Tries Gemini multimodal; falls back to local text analysis of empty transcription.
+    """
+    if GEMINI_READY:
+        try:
+            return classify_audio_with_gemini(audio_bytes, mime_type)
+        except Exception as e:
+            # Fallback: treat as empty text (will get EMPTY response)
+            result = classify_intent_locally("")
+            result["error"] = str(e)
+            result["source"] = "fallback_audio_error"
+            result["transcription"] = ""
+            return result
+    else:
+        return {
+            "transcription": "",
+            "intent": "UNKNOWN",
+            "response_amharic": "ድምጽ ማቀናበር አልተቻለም። እባክዎ በጽሁፍ ይሞክሩ።",
+            "source": "no_gemini",
+        }
 
 
 # =========================================================
@@ -534,9 +600,7 @@ with st.sidebar:
             "environment variable to enable Gemini."
         )
 
-    if not MIC_AVAILABLE:
-        st.warning("🎤 Voice input needs: `pip install streamlit-mic-recorder`")
-
+    # No need for mic-recorder warning since we use st.audio_input now
     with st.expander("🔍 Debug: Fallback Keywords"):
         for intent, kws in INTENT_KEYWORDS.items():
             st.caption(f"**{intent}**: {', '.join(kws)}")
@@ -546,7 +610,7 @@ with st.sidebar:
 # MAIN HEADER
 # =========================================================
 st.title("🎙️ EthioVoice AI")
-st.caption("Voice & Text Telecom Assistant — powered by Gemini NLU")
+st.caption("Voice & Text Telecom Assistant — powered by Gemini Multimodal NLU")
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "🎙️ የድምፅ/ጽሁፍ ትእዛዝ",
@@ -561,41 +625,54 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # =========================================================
 with tab1:
     st.subheader("🎙️ የድምፅ ወይም ጽሁፍ ትእዛዝ ይስጡ")
-    st.caption("Speak or type your command in Amharic — slang, typos, and accents are okay.")
+    st.caption("Record your voice or type your command in Amharic — slang, typos, and accents are okay.")
 
-    voice_text = None
-    if MIC_AVAILABLE:
-        voice_text = speech_to_text(
-            language="am-ET",
-            start_prompt="🎤 መናገር ጀምር (Start Speaking)",
-            stop_prompt="⏹️ አቁም (Stop)",
-            just_once=True,
-            use_container_width=True,
-            key="mic_input",
-        )
-        if voice_text:
-            st.markdown(f"<div class='info-card'>🗣️ የተያዘ ንግግር: <b>{voice_text}</b></div>",
-                        unsafe_allow_html=True)
-    else:
-        st.info("🎤 Real voice input unavailable — install `streamlit-mic-recorder` to enable it. Text works below.")
+    # --- Audio input (native Streamlit) ---
+    audio_input = st.audio_input("ድምፅዎን ይቅረፁ (Record Audio)", key="audio_input")
+    transcribed_audio_text = None
+    result_from_audio = None
 
+    if audio_input is not None:
+        # Read the raw audio bytes
+        audio_bytes = audio_input.read()
+        if audio_bytes:
+            with st.spinner("🎧 ድምፅዎን በመተንተን ላይ... (Analyzing your audio...)"):
+                # Assume wav; adjust if necessary based on actual format
+                audio_result = process_audio_command(audio_bytes, mime_type="audio/wav")
+                result_from_audio = audio_result
+                transcribed_audio_text = audio_result.get("transcription", "")
+                if transcribed_audio_text:
+                    st.info(f"የተሰማው ድምፅ: **{transcribed_audio_text}**")
+                else:
+                    st.warning("ምንም ድምፅ አልተሰማም።")
+
+    # --- Text input (alternative) ---
     typed_text = st.text_input("✏️ ወይም እዚህ ይተይቡ (Or type here)", key="typed_command")
+    process_text = st.button("➡️ ትእዛዝ አስፈጽም (Process Text Command)")
 
-    process = st.button("➡️ ትእዛዝ አስፈጽም (Process Command)")
-
-    final_command = voice_text if voice_text else typed_text
-
-    if process:
+    # Determine which result to use: audio has priority if available; else text if button pressed
+    if result_from_audio is not None:
+        result = result_from_audio
+        final_command = transcribed_audio_text or ""
+        source_label = "🎧 Gemini Audio"
+    elif process_text:
         with st.spinner("🧠 ትእዛዝዎን በመተንተን ላይ... (Understanding your command...)"):
-            result = understand_command(final_command)
+            result = understand_command(typed_text)
+        final_command = typed_text
+        source_label = "📝 Text Input"
+    else:
+        result = None
+        final_command = ""
+        source_label = ""
 
-        intent = result["intent"]
+    if result is not None:
+        intent = result.get("intent", "UNKNOWN")
         params = result.get("parameters", {})
         ai_response = result.get("response_amharic", "")
         source = result.get("source", "unknown")
         model_used = result.get("model_used")
 
-        if source == "gemini":
+        if source in ("gemini", "gemini_audio"):
             badge_label = f"🧠 Gemini AI ({model_used})" if model_used else "🧠 Gemini AI"
         elif source == "fallback":
             badge_label = "🔁 Local Fallback"
@@ -608,8 +685,12 @@ with tab1:
 
         st.markdown("---")
 
-        if not final_command:
+        if not final_command and not transcribed_audio_text:
             st.markdown(f"<span class='badge-error'>{ai_response}</span>", unsafe_allow_html=True)
+
+        elif intent == "GREETING":
+            st.markdown("<span class='badge-success'>👋 ሰላምታ ተገኝቷል</span>", unsafe_allow_html=True)
+            st.markdown(ai_response)
 
         elif intent == "CHECK_BALANCE":
             st.markdown("<span class='badge-success'>✅ ቀሪ ሂሳብ ተገኝቷል</span>", unsafe_allow_html=True)
@@ -626,7 +707,7 @@ with tab1:
         elif intent == "TRANSFER_TELEBIRR":
             st.info(f"🗣️ {ai_response}" if ai_response else
                     "💸 ገንዘብ ማስተላለፍ ይፈልጋሉ። እባክዎ ከ«💸 ቴሌብር ማስተላለፊያ» ትር ውስጥ ዝርዝሮችን ያስገቡ።")
-            # Pre-fill the transfer tab if Gemini/fallback extracted phone/amount
+            # Pre-fill the transfer tab if phone/amount extracted
             if params.get("phone_number"):
                 st.session_state.prefill_phone = str(params["phone_number"])
             if params.get("amount"):
@@ -643,7 +724,7 @@ with tab1:
             ))
 
         if "error" in result:
-            st.caption(f"⚠️ All Gemini models failed, used local fallback. Details: {result['error']}")
+            st.caption(f"⚠️ All Gemini models failed, used fallback. Details: {result['error']}")
 
 
 # =========================================================
@@ -743,4 +824,4 @@ else:
 st.caption(
     "⚠️ ማሳሰቢያ: ይህ የማሳያ (Demo) ስሪት ነው። ትክክለኛ ገንዘብ አይንቀሳቀስም። / "
     "This is a simulation for demo purposes only — no real transactions occur."
-)
+    )
