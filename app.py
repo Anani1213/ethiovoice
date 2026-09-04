@@ -1,369 +1,530 @@
 """
-EthioVoice AI - Amharic Voice Assistant Simulator
-Simulates Ethio Telecom & Telebirr services via real browser voice recording.
+EthioVoice AI — Voice & Text Telecom Assistant
+Competition build for Ethio Telecom.
 Run with: streamlit run app.py
 """
 
 import streamlit as st
-import json
 import random
-import io
 import re
-import hashlib
+import difflib
 from datetime import datetime
 
+# Optional real browser microphone input (Web Speech API via streamlit-mic-recorder)
 try:
-    from openai import OpenAI
-    OPENAI_SDK_AVAILABLE = True
+    from streamlit_mic_recorder import speech_to_text
+    MIC_AVAILABLE = True
 except ImportError:
-    OPENAI_SDK_AVAILABLE = False
+    MIC_AVAILABLE = False
 
-# ---------- Load Configuration ----------
-with open("prompts.json", "r", encoding="utf-8") as f:
-    CONFIG = json.load(f)
+UNLIMITED = "ያልተገደበ (Unlimited)"
 
+# =========================================================
+# PAGE CONFIG + ACCESSIBILITY-FIRST CSS
+# =========================================================
 st.set_page_config(page_title="EthioVoice AI", page_icon="🎙️", layout="centered")
 
-# ---------- Simulated User Account State ----------
-if "balance" not in st.session_state:
-    st.session_state.balance = 125.50
-if "data_balance" not in st.session_state:
-    st.session_state.data_balance = 2.3
-if "voice_minutes" not in st.session_state:
-    st.session_state.voice_minutes = 45
-if "telebirr_balance" not in st.session_state:
-    st.session_state.telebirr_balance = 850.00
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "last_audio_hash" not in st.session_state:
-    st.session_state.last_audio_hash = None
-if "recognized_text" not in st.session_state:
-    st.session_state.recognized_text = ""
+st.markdown("""
+<style>
+    html, body, [class*="css"]  {
+        font-size: 19px !important;
+    }
+    h1 { font-size: 2.1rem !important; }
+    h2, h3 { font-size: 1.4rem !important; }
+    .stButton > button {
+        font-size: 1.15rem !important;
+        font-weight: 600 !important;
+        padding: 0.9em 1.2em !important;
+        border-radius: 14px !important;
+        border: 2px solid #0b6623 !important;
+        min-height: 3.2em;
+        width: 100%;
+    }
+    .stTextInput > div > div > input {
+        font-size: 1.1rem !important;
+        padding: 0.7em !important;
+    }
+    .badge-success {
+        display: inline-block;
+        background-color: #d4edda;
+        color: #0b6623;
+        border: 2px solid #0b6623;
+        padding: 10px 18px;
+        border-radius: 12px;
+        font-weight: 700;
+        font-size: 1.1rem;
+        margin-bottom: 8px;
+    }
+    .badge-error {
+        display: inline-block;
+        background-color: #f8d7da;
+        color: #842029;
+        border: 2px solid #842029;
+        padding: 10px 18px;
+        border-radius: 12px;
+        font-weight: 700;
+        font-size: 1.1rem;
+        margin-bottom: 8px;
+    }
+    .info-card {
+        background-color: #f5f9ff;
+        border: 2px solid #cfe0f5;
+        border-radius: 14px;
+        padding: 16px;
+        margin-bottom: 10px;
+    }
+    .pkg-price {
+        font-size: 1.3rem;
+        font-weight: 800;
+        color: #0b6623;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Sample phrases used for simulated recognition mode
-DEMO_PHRASES = {
-    "check_balance": "ቀሪ ሂሳቤን አሳየኝ",
-    "buy_package": "ጥቅል መግዛት እፈልጋለሁ",
-    "telebirr_transfer": "ገንዘብ ወደ ቴሌብር ላክ",
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+defaults = {
+    "balance": 125.50,           # ETB airtime
+    "data_balance": 2.3,         # GB (float) or UNLIMITED string
+    "voice_minutes": 45,         # int or UNLIMITED string
+    "sms_balance": 50,
+    "telebirr_balance": 850.00,
+    "history": [],
+    "recognized_text": "",
+    "last_audio_hash": None,
 }
+for key, val in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
 
-# ---------- Intent Keyword Definitions ----------
-INTENT_KEYWORDS = {
-    "check_balance": ["ቀሪ", "ሂሳብ", "ሒሳብ", "ብር", "ያለኝ", "balance", "804"],
-    "buy_package": ["ፓኬጅ", "ፓኬጂ", "ጥቅል", "ኢንተርኔት", "ደቂቃ", "package", "bundle"],
-    "telebirr_transfer": ["ላክ", "መላክ", "ትራንስፈር", "ቴሌብር", "transfer", "send"],
-}
 
-# Amharic character-variation normalization map
-# (maps visually/phonetically similar variants to one canonical form)
+# =========================================================
+# NORMALIZATION (handles typos, slang, spelling variants)
+# =========================================================
 AMHARIC_NORMALIZATION_MAP = {
-    "ሒ": "ሂ",
-    "ሓ": "ሀ",
-    "ኅ": "ሀ",
-    "ሑ": "ሁ",
-    "ኁ": "ሁ",
-    "ሔ": "ሄ",
-    "ኄ": "ሄ",
-    "ሕ": "ህ",
-    "ኅ": "ህ",
-    "ሖ": "ሆ",
-    "ኆ": "ሆ",
-    "ሠ": "ሰ",
-    "ሡ": "ሱ",
-    "ሢ": "ሲ",
-    "ሣ": "ሳ",
-    "ሤ": "ሴ",
-    "ሥ": "ስ",
-    "ሦ": "ሶ",
-    "ዐ": "አ",
-    "ዑ": "ኡ",
-    "ዒ": "ኢ",
-    "ዓ": "ኣ",
-    "ዔ": "ኤ",
-    "ዕ": "እ",
-    "ዖ": "ኦ",
-    "ፀ": "ጸ",
-    "ፁ": "ጹ",
-    "ፂ": "ጺ",
-    "ፃ": "ጻ",
-    "ፄ": "ጼ",
-    "ፅ": "ጽ",
-    "ፆ": "ጾ",
+    "ሒ": "ሂ", "ሓ": "ሀ", "ኅ": "ህ", "ሑ": "ሁ", "ኁ": "ሁ",
+    "ሔ": "ሄ", "ኄ": "ሄ", "ሕ": "ህ", "ሖ": "ሆ", "ኆ": "ሆ",
+    "ሠ": "ሰ", "ሡ": "ሱ", "ሢ": "ሲ", "ሣ": "ሳ", "ሤ": "ሴ",
+    "ሥ": "ስ", "ሦ": "ሶ", "ዐ": "አ", "ዑ": "ኡ", "ዒ": "ኢ",
+    "ዓ": "ኣ", "ዔ": "ኤ", "ዕ": "እ", "ዖ": "ኦ", "ፀ": "ጸ",
+    "ፁ": "ጹ", "ፂ": "ጺ", "ፃ": "ጻ", "ፄ": "ጼ", "ፅ": "ጽ",
+    "ፆ": "ጾ", "ፓኬጂ": "ፓኬጅ",
 }
 
 
 def normalize_text(text):
-    """
-    Normalize Amharic (and mixed Amharic/English) text before intent matching:
-    - Lowercase (affects any Latin-script words like 'balance', 'send')
-    - Replace visually/phonetically similar Amharic character variants
-    - Collapse multiple spaces, strip leading/trailing whitespace
-    - Remove common punctuation that can break substring matches
-    """
     if not text:
         return ""
-
     text = text.strip().lower()
-
-    # Normalize Amharic character variants
     for variant, canonical in AMHARIC_NORMALIZATION_MAP.items():
         text = text.replace(variant, canonical)
-
-    # Remove punctuation (Amharic + Latin) that could interfere with matching
-    text = re.sub(r"[፣፤፥፦፧፨.,!?;:\"'()\[\]]", " ", text)
-
-    # Collapse whitespace (multiple spaces, tabs, newlines -> single space)
+    text = re.sub(r"[፣፤፥፦፧፨.,!?;:\"'()\[\]*#]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-
     return text
 
 
-# ---------- Intent Detection (Keyword / Substring Matching) ----------
-def detect_intent(text):
+# =========================================================
+# INTENT KEYWORDS + FUZZY MATCHING
+# =========================================================
+INTENT_KEYWORDS = {
+    "check_balance": [
+        "ቀሪ", "ሂሳብ", "ሒሳብ", "ብር", "ስንት አለኝ", "ያለኝ", "balance", "804"
+    ],
+    "buy_package": [
+        "ፓኬጅ", "ፓኬጂ", "ጥቅል", "ኢንተርኔት", "ዳታ", "ደቂቃ",
+        "ሳምንታዊ", "ወርሃዊ", "package", "bundle"
+    ],
+    "telebirr_transfer": [
+        "ላክ", "መላክ", "ትራንስፈር", "ቴሌብር", "ገንዘብ", "send", "transfer"
+    ],
+}
+
+FUZZY_THRESHOLD = 0.78  # similarity ratio for typo tolerance
+
+
+def keyword_matches(keyword, normalized_text):
+    """Exact substring match first, then per-word fuzzy match for typos/accents."""
+    norm_keyword = normalize_text(keyword)
+    if norm_keyword in normalized_text:
+        return True
+    for word in normalized_text.split():
+        if difflib.SequenceMatcher(None, word, norm_keyword).ratio() >= FUZZY_THRESHOLD:
+            return True
+    return False
+
+
+def detect_intent(raw_text):
     """
-    Detects intent using substring/keyword matching against normalized text.
-    Returns the first matching intent, or 'unknown' if no keyword is found.
+    Returns (intent, matched_intents_list).
+    intent is one of: check_balance, buy_package, telebirr_transfer,
+                       'ambiguous', 'unknown'
     """
-    normalized = normalize_text(text)
+    normalized = normalize_text(raw_text)
+    if not normalized:
+        return "unknown", []
 
-    for intent_name, keywords in INTENT_KEYWORDS.items():
-        for keyword in keywords:
-            normalized_keyword = normalize_text(keyword)
-            if normalized_keyword in normalized:
-                return intent_name
+    matched = []
+    for intent, keywords in INTENT_KEYWORDS.items():
+        if any(keyword_matches(k, normalized) for k in keywords):
+            matched.append(intent)
 
-    return "unknown"
+    if len(matched) == 1:
+        return matched[0], matched
+    elif len(matched) > 1:
+        return "ambiguous", matched
+    else:
+        return "unknown", []
 
 
-# ---------- Feature Functions ----------
-def check_balance():
-    return CONFIG["responses"]["check_balance"].format(
-        balance=f"{st.session_state.balance:.2f}",
-        data=f"{st.session_state.data_balance:.1f}",
-        minutes=st.session_state.voice_minutes,
+# =========================================================
+# ETHIO TELECOM PACKAGE CATALOG
+# =========================================================
+PACKAGES = {
+    "daily": [
+        {"id": "d1", "name": "100MB ቀናዊ ጥቅል", "data_mb": 100, "price": 10, "validity": "1 ቀን"},
+        {"id": "d2", "name": "300MB ቀናዊ ጥቅል", "data_mb": 300, "price": 18, "validity": "1 ቀን"},
+        {"id": "d3", "name": "500MB ቀናዊ ጥቅል", "data_mb": 500, "price": 25, "validity": "1 ቀን"},
+    ],
+    "weekly": [
+        {"id": "w1", "name": "1GB ሳምንታዊ ጥቅል", "data_mb": 1024, "price": 70, "validity": "7 ቀናት"},
+        {"id": "w2", "name": "3GB ሳምንታዊ ጥቅል", "data_mb": 3072, "price": 150, "validity": "7 ቀናት"},
+        {"id": "w3", "name": "5GB ሳምንታዊ ጥቅል", "data_mb": 5120, "price": 220, "validity": "7 ቀናት"},
+    ],
+    "monthly": [
+        {"id": "m1", "name": "10GB ወርሃዊ ጥቅል", "data_mb": 10240, "price": 350, "validity": "30 ቀናት"},
+        {"id": "m2", "name": "20GB ወርሃዊ ጥቅል", "data_mb": 20480, "price": 600, "validity": "30 ቀናት"},
+        {"id": "m3", "name": "ያልተገደበ ኢንተርኔት ወርሃዊ ጥቅል", "data_mb": None, "unlimited_data": True,
+         "price": 900, "validity": "30 ቀናት"},
+    ],
+    "combo": [
+        {"id": "c1", "name": "ኮምቦ: 200 ደቂቃ + 200 ኤስኤምኤስ + 1GB", "minutes": 200, "sms": 200,
+         "data_mb": 1024, "price": 120, "validity": "7 ቀናት"},
+        {"id": "c2", "name": "ኮምቦ: 500 ደቂቃ + 500 ኤስኤምኤስ + 5GB", "minutes": 500, "sms": 500,
+         "data_mb": 5120, "price": 350, "validity": "30 ቀናት"},
+        {"id": "c3", "name": "ኮምቦ: ያልተገደበ ደቂቃ + 10GB ዳታ", "minutes": None, "unlimited_minutes": True,
+         "sms": 0, "data_mb": 10240, "price": 500, "validity": "30 ቀናት"},
+    ],
+}
+
+CATEGORY_LABELS = {
+    "daily": "🌞 ቀናዊ ጥቅሎች (Daily)",
+    "weekly": "📅 ሳምንታዊ ጥቅሎች (Weekly)",
+    "monthly": "🗓️ ወርሃዊ ጥቅሎች (Monthly)",
+    "combo": "🎁 ኮምቦ ጥቅሎች (Voice+SMS+Data)",
+}
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def format_data(value):
+    if value == UNLIMITED:
+        return UNLIMITED
+    if value >= 1024:
+        return f"{value/1024:.1f} ጂቢ (GB)"
+    return f"{value:.0f} ሜባ (MB)"
+
+
+def format_minutes(value):
+    if value == UNLIMITED:
+        return UNLIMITED
+    return f"{value} ደቂቃ"
+
+
+def log_activity(text):
+    st.session_state.history.append(f"{datetime.now().strftime('%H:%M')} - {text}")
+
+
+# =========================================================
+# CORE FEATURE FUNCTIONS
+# =========================================================
+def check_balance_text():
+    return (
+        f"📞 የአየር ሰዓት ቀሪ ሂሳብ: **{st.session_state.balance:.2f} ብር**\n\n"
+        f"📶 ዳታ ቀሪ: **{format_data(st.session_state.data_balance)}**\n\n"
+        f"🗣️ ድምጽ ቀሪ: **{format_minutes(st.session_state.voice_minutes)}**\n\n"
+        f"✉️ ኤስኤምኤስ ቀሪ: **{st.session_state.sms_balance}**"
     )
 
 
-def buy_package(package_key):
-    packages = CONFIG["packages"]
-    if package_key not in packages:
-        return CONFIG["responses"]["package_not_found"]
+def find_package(category, pkg_id):
+    for pkg in PACKAGES.get(category, []):
+        if pkg["id"] == pkg_id:
+            return pkg
+    return None
 
-    pkg = packages[package_key]
+
+def buy_package(category, pkg_id):
+    pkg = find_package(category, pkg_id)
+    if not pkg:
+        return False, "⚠️ ይቅርታ፣ የተመረጠው ጥቅል አልተገኘም።"
+
     if st.session_state.balance < pkg["price"]:
-        return CONFIG["responses"]["insufficient_balance"].format(
-            balance=f"{st.session_state.balance:.2f}"
+        return False, (
+            f"⚠️ በቂ ሂሳብ የለዎትም። የ{pkg['name']} ዋጋ {pkg['price']} ብር ሲሆን "
+            f"የአሁኑ ቀሪ ሂሳብዎ {st.session_state.balance:.2f} ብር ብቻ ነው። "
+            f"እባክዎ አየር ሰዓት ይሙሉ።"
         )
 
     st.session_state.balance -= pkg["price"]
-    if pkg["type"] == "data":
-        st.session_state.data_balance += pkg["amount"]
-    elif pkg["type"] == "voice":
-        st.session_state.voice_minutes += pkg["amount"]
 
-    st.session_state.history.append(
-        f"{datetime.now().strftime('%H:%M')} - ግዢ: {pkg['name']}"
+    # Data
+    if pkg.get("unlimited_data"):
+        st.session_state.data_balance = UNLIMITED
+    elif pkg.get("data_mb") and st.session_state.data_balance != UNLIMITED:
+        st.session_state.data_balance += pkg["data_mb"] / 1024
+
+    # Minutes
+    if pkg.get("unlimited_minutes"):
+        st.session_state.voice_minutes = UNLIMITED
+    elif pkg.get("minutes") and st.session_state.voice_minutes != UNLIMITED:
+        st.session_state.voice_minutes += pkg["minutes"]
+
+    # SMS
+    if pkg.get("sms"):
+        st.session_state.sms_balance += pkg["sms"]
+
+    log_activity(f"ግዢ: {pkg['name']} ({pkg['price']} ብር)")
+    return True, (
+        f"✅ የ{pkg['name']} ጥቅል በተሳካ ሁኔታ ተገዝቷል!\n\n"
+        f"💰 ተቀናሽ የተደረገ: {pkg['price']} ብር\n"
+        f"💳 አዲስ ቀሪ ሂሳብ: {st.session_state.balance:.2f} ብር\n"
+        f"⏳ ልክነት: {pkg['validity']}"
     )
-    return CONFIG["responses"]["package_success"].format(
-        name=pkg["name"], price=pkg["price"], balance=f"{st.session_state.balance:.2f}"
-    )
 
 
-def telebirr_transfer(phone, amount):
+def telebirr_transfer(phone, amount_str):
+    phone = (phone or "").strip()
     try:
-        amount = float(amount)
-    except ValueError:
-        return CONFIG["responses"]["invalid_amount"]
+        amount = float(amount_str)
+    except (ValueError, TypeError):
+        return False, "⚠️ እባክዎ ትክክለኛ የገንዘብ መጠን ያስገቡ።"
 
-    if not phone or len(phone.strip()) < 9:
-        return CONFIG["responses"]["invalid_phone"]
+    if len(phone) < 9:
+        return False, "⚠️ እባክዎ ትክክለኛ የስልክ ቁጥር ያስገቡ (ለምሳሌ 0912345678)።"
     if amount <= 0:
-        return CONFIG["responses"]["invalid_amount"]
+        return False, "⚠️ የሚላከው መጠን ከዜሮ በላይ መሆን አለበት።"
     if amount > st.session_state.telebirr_balance:
-        return CONFIG["responses"]["telebirr_insufficient"].format(
-            balance=f"{st.session_state.telebirr_balance:.2f}"
+        return False, (
+            f"⚠️ በቴሌብር ሂሳብዎ በቂ ገንዘብ የለም። "
+            f"የአሁኑ ቀሪ ሂሳብ: {st.session_state.telebirr_balance:.2f} ብር።"
         )
 
     st.session_state.telebirr_balance -= amount
     txn_id = f"TB{random.randint(100000, 999999)}"
-    st.session_state.history.append(
-        f"{datetime.now().strftime('%H:%M')} - ማስተላለፍ: {amount:.2f} ብር ወደ {phone}"
+    log_activity(f"ማስተላለፍ: {amount:.2f} ብር ወደ {phone}")
+    return True, (
+        f"✅ **{amount:.2f} ብር** ወደ **{phone}** በተሳካ ሁኔታ ተልኳል!\n\n"
+        f"🧾 የግብይት መለያ: `{txn_id}`\n"
+        f"💳 አዲስ የቴሌብር ቀሪ ሂሳብ: {st.session_state.telebirr_balance:.2f} ብር"
     )
-    return CONFIG["responses"]["telebirr_success"].format(
-        amount=f"{amount:.2f}", phone=phone, txn_id=txn_id,
-        balance=f"{st.session_state.telebirr_balance:.2f}",
-    )
 
 
-def transcribe_with_whisper(audio_bytes, api_key):
-    """Real Amharic transcription via OpenAI Whisper. Raises on failure."""
-    client = OpenAI(api_key=api_key)
-    audio_file = io.BytesIO(audio_bytes)
-    audio_file.name = "recording.wav"
-    result = client.audio.transcriptions.create(
-        model="whisper-1",
-        file=audio_file,
-        language="am",
-    )
-    return result.text
-
-
-# ---------- Sidebar: Judge / Demo Mode ----------
+# =========================================================
+# SIDEBAR — JUDGE / TEST MODE
+# =========================================================
 with st.sidebar:
     st.header("🧪 Judge / Test Mode")
-    st.caption("Set custom account values to test balance checks, purchases, "
-               "and Telebirr transfers on demand.")
+    st.caption("Set custom balances to test any feature instantly.")
 
-    sim_balance = st.number_input(
-        "Simulated Airtime Balance (ETB)", min_value=0.0,
-        value=float(st.session_state.balance), step=10.0, format="%.2f"
-    )
-    sim_data = st.number_input(
-        "Simulated Data Balance (GB)", min_value=0.0,
-        value=float(st.session_state.data_balance), step=0.5, format="%.1f"
-    )
-    sim_minutes = st.number_input(
-        "Simulated Voice Minutes", min_value=0,
-        value=int(st.session_state.voice_minutes), step=10
-    )
-    sim_telebirr = st.number_input(
-        "Simulated Telebirr Balance (ETB)", min_value=0.0,
-        value=float(st.session_state.telebirr_balance), step=50.0, format="%.2f"
-    )
+    sim_balance = st.number_input("Airtime Balance (ETB)", min_value=0.0,
+                                   value=float(st.session_state.balance), step=10.0, format="%.2f")
+    sim_telebirr = st.number_input("Telebirr Balance (ETB)", min_value=0.0,
+                                    value=float(st.session_state.telebirr_balance), step=50.0, format="%.2f")
+    current_data = 0.0 if st.session_state.data_balance == UNLIMITED else float(st.session_state.data_balance)
+    sim_data = st.number_input("Data Balance (GB)", min_value=0.0, value=current_data, step=0.5, format="%.1f")
+    current_min = 0 if st.session_state.voice_minutes == UNLIMITED else int(st.session_state.voice_minutes)
+    sim_minutes = st.number_input("Voice Minutes", min_value=0, value=current_min, step=10)
 
     if st.button("✅ Apply Simulated Balance"):
         st.session_state.balance = sim_balance
+        st.session_state.telebirr_balance = sim_telebirr
         st.session_state.data_balance = sim_data
         st.session_state.voice_minutes = sim_minutes
-        st.session_state.telebirr_balance = sim_telebirr
-        st.success("Simulated balances updated!")
+        st.success("Balances updated!")
         st.rerun()
 
     st.markdown("---")
-    st.header("🎤 Voice Recognition Mode")
-    recognition_mode = st.radio(
-        "How should recorded audio be understood?",
-        ["🎭 Simulated recognition (no key needed)", "🌐 Real transcription (OpenAI Whisper)"],
-        index=0,
-    )
-    openai_api_key = ""
-    if recognition_mode.startswith("🌐"):
-        if not OPENAI_SDK_AVAILABLE:
-            st.error("`openai` package not installed. Run: `pip install openai`")
-        openai_api_key = st.text_input("OpenAI API Key", type="password")
-        st.caption("Your key is only used in this session and never stored.")
+    if not MIC_AVAILABLE:
+        st.warning("🎤 Voice input needs: `pip install streamlit-mic-recorder`")
 
-    st.markdown("---")
     with st.expander("🔍 Debug: Intent Keywords"):
         for intent, kws in INTENT_KEYWORDS.items():
             st.caption(f"**{intent}**: {', '.join(kws)}")
 
 
-# ---------- Main UI ----------
+# =========================================================
+# MAIN HEADER
+# =========================================================
 st.title("🎙️ EthioVoice AI")
-st.caption(CONFIG["system"]["tagline"])
+st.caption("Voice & Text Telecom Assistant — ለሁሉም ተደራሽ የኢትዮ ቴሌኮም ረዳት")
 
-st.markdown("### 🗣️ የድምጽ ትዕዛዝዎን ይናገሩ (Speak your command)")
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🎙️ የድምፅ/ጽሁፍ ትእዛዝ",
+    "📊 ቀሪ ሂሳብ",
+    "📦 የፓኬጅ ዝርዝሮች",
+    "💸 ቴሌብር ማስተላለፊያ",
+])
 
-audio_value = st.audio_input("የድምፅ ትእዛዝዎን ይስጡ (Record Voice)")
 
-final_command = None
-
-if audio_value is not None:
-    audio_bytes = audio_value.getvalue()
-    audio_hash = hashlib.md5(audio_bytes).hexdigest()
-    is_new_recording = audio_hash != st.session_state.last_audio_hash
-
-    if is_new_recording:
-        st.session_state.last_audio_hash = audio_hash
-        st.session_state.recognized_text = ""
-
-    st.markdown("**🔊 የተቀዳ ድምጽ (Your recording):**")
-    st.audio(audio_bytes)
-
-    if recognition_mode.startswith("🌐"):
-        # ---- Real transcription path ----
-        if st.button("➡️ ትዕዛዝ ተርጉም (Transcribe & Process)"):
-            if not OPENAI_SDK_AVAILABLE:
-                st.error("`openai` package not installed.")
-            elif not openai_api_key:
-                st.warning("እባክዎ በጎን በኩል OpenAI API Key ያስገቡ። (Please enter an API key in the sidebar.)")
-            else:
-                with st.spinner("🎧 ድምጽ በመተርጎም ላይ... (Transcribing Amharic speech...)"):
-                    try:
-                        text = transcribe_with_whisper(audio_bytes, openai_api_key)
-                        st.session_state.recognized_text = text
-                    except Exception as e:
-                        st.error(f"⚠️ ትርጉም አልተሳካም (Transcription failed): {e}")
-                        st.session_state.recognized_text = ""
-    else:
-        # ---- Simulated recognition path ----
-        st.info(
-            "🎭 **የማሳያ ሁነታ (Demo Mode):** ትክክለኛ ትርጉም ገና አልተገናኘም። "
-            "ከታች የተቀዳው ድምጽ ምን እንደሚወክል ይምረጡ።\n\n"
-            "*(Real transcription isn't connected in this mode. Select below what "
-            "your recording represents, so the assistant can respond as if it heard you.)*"
-        )
-        demo_choice = st.selectbox(
-            "ይህ ድምጽ ምን ማለት ነው? (What does this recording say?)",
-            options=list(DEMO_PHRASES.keys()),
-            format_func=lambda k: DEMO_PHRASES[k],
-            key=f"demo_choice_{audio_hash}",
-        )
-        if st.button("➡️ ትዕዛዝ አስኪድ (Process as this command)"):
-            st.session_state.recognized_text = DEMO_PHRASES[demo_choice]
-
-    if st.session_state.recognized_text:
-        st.success(f"🗣️ የተያዘ ንግግር (Recognized speech): **{st.session_state.recognized_text}**")
-        final_command = st.session_state.recognized_text
-
-# ---------- Process Recognized Command ----------
-if final_command:
-    intent = detect_intent(final_command)
-
-    with st.expander("🔍 Debug: Matching Details"):
-        st.text(f"Raw text: {final_command}")
-        st.text(f"Normalized text: {normalize_text(final_command)}")
-        st.text(f"Detected intent: {intent}")
-
-    st.markdown("---")
-    if intent == "check_balance":
-        st.success(check_balance())
-    elif intent == "buy_package":
-        st.info(CONFIG["responses"]["ask_package_choice"])
-    elif intent == "telebirr_transfer":
-        st.info(CONFIG["responses"]["ask_transfer_details"])
-    else:
-        st.warning(CONFIG["responses"]["unknown_intent"])
-
-st.markdown("---")
-
-# ---------- Manual Feature Panels (guided fallback flow) ----------
-tab1, tab2, tab3 = st.tabs(["📊 ቀሪ ሂሳብ", "📦 ጥቅል ግዢ", "💸 ቴሌብር ማስተላለፍ"])
-
+# =========================================================
+# TAB 1 — VOICE & TEXT CONSOLE
+# =========================================================
 with tab1:
-    st.subheader("Check Balance (*804#)")
-    if st.button("ቀሪ ሂሳብ አሳይ (Show Balance)"):
-        st.success(check_balance())
+    st.subheader("🎙️ የድምፅ ወይም ጽሁፍ ትእዛዝ ይስጡ")
+    st.caption("Speak or type your command in Amharic — slang, typos, and accents are okay.")
 
+    voice_text = None
+    if MIC_AVAILABLE:
+        voice_text = speech_to_text(
+            language="am-ET",
+            start_prompt="🎤 መናገር ጀምር (Start Speaking)",
+            stop_prompt="⏹️ አቁም (Stop)",
+            just_once=True,
+            use_container_width=True,
+            key="mic_input",
+        )
+        if voice_text:
+            st.markdown(f"<div class='info-card'>🗣️ የተያዘ ንግግር: <b>{voice_text}</b></div>",
+                        unsafe_allow_html=True)
+    else:
+        st.info("🎤 Real voice input unavailable — install `streamlit-mic-recorder` to enable it. Text works below.")
+
+    typed_text = st.text_input("✏️ ወይም እዚህ ይተይቡ (Or type here)", key="typed_command")
+
+    process = st.button("➡️ ትእዛዝ አስፈጽም (Process Command)")
+
+    final_command = voice_text if voice_text else typed_text
+
+    if process:
+        if not final_command:
+            st.markdown("<span class='badge-error'>እባክዎ በመጀመሪያ ይናገሩ ወይም ይተይቡ።</span>",
+                        unsafe_allow_html=True)
+        else:
+            intent, matched = detect_intent(final_command)
+
+            with st.expander("🔍 Debug: Matching Details"):
+                st.text(f"Raw: {final_command}")
+                st.text(f"Normalized: {normalize_text(final_command)}")
+                st.text(f"Matched intents: {matched}")
+                st.text(f"Final intent: {intent}")
+
+            st.markdown("---")
+            if intent == "check_balance":
+                st.markdown("<span class='badge-success'>✅ ቀሪ ሂሳብ ተገኝቷል</span>", unsafe_allow_html=True)
+                st.markdown(check_balance_text())
+
+            elif intent == "buy_package":
+                st.info("📦 ጥቅል መግዛት ይፈልጋሉ። እባክዎ ከ«📦 የፓኬጅ ዝርዝሮች» ትር ውስጥ የሚፈልጉትን ጥቅል ይምረጡ።")
+
+            elif intent == "telebirr_transfer":
+                st.info("💸 ገንዘብ ማስተላለፍ ይፈልጋሉ። እባክዎ ከ«💸 ቴሌብር ማስተላለፊያ» ትር ውስጥ ዝርዝሮችን ያስገቡ።")
+
+            elif intent == "ambiguous":
+                readable = " / ".join(matched)
+                st.warning(
+                    f"🤔 ትእዛዝዎ ከአንድ በላይ አገልግሎት ጋር ይመሳሰላል ({readable})። "
+                    f"እባክዎ በግልጽ ይናገሩ፦ 'ቀሪ ሂሳብ አሳየኝ'፣ 'ጥቅል መግዛት እፈልጋለሁ'፣ ወይም 'ገንዘብ ላክ'።"
+                )
+
+            else:
+                st.warning(
+                    "😕 ይቅርታ፣ በትክክል አልተረዳሁትም። እባክዎ በሚከተለው መልኩ ይሞክሩ፦\n\n"
+                    "- «ቀሪ ሂሳቤን አሳየኝ» (ለቀሪ ሂሳብ)\n"
+                    "- «ጥቅል መግዛት እፈልጋለሁ» (ለፓኬጅ ግዢ)\n"
+                    "- «ገንዘብ ወደ ቴሌብር ላክ» (ለቴሌብር ማስተላለፍ)"
+                )
+
+
+# =========================================================
+# TAB 2 — BALANCE CHECK
+# =========================================================
 with tab2:
-    st.subheader("Buy Internet / Voice Package")
-    package_options = {v["name"]: k for k, v in CONFIG["packages"].items()}
-    chosen = st.selectbox("ጥቅል ይምረጡ (Choose a package)", list(package_options.keys()))
-    if st.button("ግዛ (Buy)"):
-        st.success(buy_package(package_options[chosen]))
+    st.subheader("📊 ቀሪ ሂሳብ (*804#)")
+    c1, c2 = st.columns(2)
+    c1.metric("📞 አየር ሰዓት", f"{st.session_state.balance:.2f} ብር")
+    c2.metric("💳 ቴሌብር", f"{st.session_state.telebirr_balance:.2f} ብር")
+    c3, c4 = st.columns(2)
+    c3.metric("📶 ዳታ", format_data(st.session_state.data_balance))
+    c4.metric("🗣️ ደቂቃ", format_minutes(st.session_state.voice_minutes))
+    st.metric("✉️ ኤስኤምኤስ", st.session_state.sms_balance)
 
+    if st.button("🔄 ቀሪ ሂሳብ አድስ (Refresh)"):
+        st.rerun()
+
+
+# =========================================================
+# TAB 3 — PACKAGE STORE
+# =========================================================
 with tab3:
-    st.subheader("Telebirr Money Transfer (Simulation)")
-    phone_number = st.text_input("የተቀባይ ስልክ ቁጥር (Recipient phone)", "09")
-    amount = st.text_input("የሚላከው መጠን (Amount in ETB)", "")
-    if st.button("ላክ ገንዘብ (Send Money)"):
-        st.success(telebirr_transfer(phone_number, amount))
+    st.subheader("📦 የፓኬጅ ዝርዝሮች")
+    category = st.selectbox("ምድብ ይምረጡ (Choose category)",
+                             list(CATEGORY_LABELS.keys()),
+                             format_func=lambda c: CATEGORY_LABELS[c])
 
+    for pkg in PACKAGES[category]:
+        with st.container():
+            st.markdown(f"<div class='info-card'>", unsafe_allow_html=True)
+            colA, colB = st.columns([3, 1])
+            with colA:
+                st.markdown(f"**{pkg['name']}**")
+                details = []
+                if pkg.get("unlimited_data"):
+                    details.append(f"ዳታ: {UNLIMITED}")
+                elif pkg.get("data_mb"):
+                    details.append(f"ዳታ: {format_data(pkg['data_mb'])}")
+                if pkg.get("unlimited_minutes"):
+                    details.append(f"ደቂቃ: {UNLIMITED}")
+                elif pkg.get("minutes"):
+                    details.append(f"ደቂቃ: {pkg['minutes']}")
+                if pkg.get("sms"):
+                    details.append(f"ኤስኤምኤስ: {pkg['sms']}")
+                details.append(f"ልክነት: {pkg['validity']}")
+                st.caption(" | ".join(details))
+                st.markdown(f"<span class='pkg-price'>{pkg['price']} ብር</span>", unsafe_allow_html=True)
+            with colB:
+                if st.button("ግዛ", key=f"buy_{pkg['id']}"):
+                    success, msg = buy_package(category, pkg["id"])
+                    if success:
+                        st.markdown("<span class='badge-success'>✅ ተሳክቷል!</span>", unsafe_allow_html=True)
+                        st.markdown(msg)
+                        st.rerun()
+                    else:
+                        st.markdown("<span class='badge-error'>❌ አልተሳካም</span>", unsafe_allow_html=True)
+                        st.markdown(msg)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
+# =========================================================
+# TAB 4 — TELEBIRR TRANSFER
+# =========================================================
+with tab4:
+    st.subheader("💸 ቴሌብር ማስተላለፊያ")
+    st.metric("💳 የአሁኑ ቴሌብር ቀሪ ሂሳብ", f"{st.session_state.telebirr_balance:.2f} ብር")
+
+    phone_number = st.text_input("📱 የተቀባይ ስልክ ቁጥር", placeholder="0912345678")
+    amount = st.text_input("💰 የሚላከው መጠን (ብር)", placeholder="ለምሳሌ 100")
+
+    if st.button("➡️ ገንዘብ ላክ (Send Money)"):
+        success, msg = telebirr_transfer(phone_number, amount)
+        if success:
+            st.markdown("<span class='badge-success'>✅ ግብይት ተሳክቷል!</span>", unsafe_allow_html=True)
+            st.markdown(msg)
+            st.rerun()
+        else:
+            st.markdown("<span class='badge-error'>❌ ግብይት አልተሳካም</span>", unsafe_allow_html=True)
+            st.markdown(msg)
+
+
+# =========================================================
+# ACTIVITY HISTORY (shown on every tab visit, at bottom)
+# =========================================================
 st.markdown("---")
 st.markdown("### 🕒 የቅርብ ጊዜ እንቅስቃሴ (Recent Activity)")
 if st.session_state.history:
-    for h in reversed(st.session_state.history[-5:]):
+    for h in reversed(st.session_state.history[-6:]):
         st.text(h)
 else:
     st.text("ምንም እንቅስቃሴ የለም።")
@@ -371,4 +532,4 @@ else:
 st.caption(
     "⚠️ ማሳሰቢያ: ይህ የማሳያ (Demo) ስሪት ነው። ትክክለኛ ገንዘብ አይንቀሳቀስም። / "
     "This is a simulation for demo purposes only — no real transactions occur."
-            )
+    )
