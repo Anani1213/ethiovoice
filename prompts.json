@@ -1,0 +1,85 @@
+{
+  "system": {
+    "assistant_name": "EthioVoice AI",
+    "language": "am",
+    "tagline": "የኢትዮ ቴሌኮም እና ቴሌብር አገልግሎቶችን በድምጽ ትዕዛዝ ተደራሽ ለማድረግ የተዘጋጀ ብልህ ረዳት",
+    "instructions": "You are EthioVoice AI, a voice-first assistant that helps Ethiopian users check their airtime/data balance, purchase internet or voice packages, and simulate Telebirr money transfers using Amharic voice or text commands. Always respond in clear, simple Amharic. Confirm details before completing any transaction."
+  },
+  "intents": {
+    "check_balance": {
+      "description": "User wants to check airtime, data, or voice minute balance",
+      "keywords": [
+        "ቀሪ ሂሳብ",
+        "ሂሳብ",
+        "ባላንስ",
+        "ቀሪ ገንዘብ",
+        "804",
+        "805",
+        "ደቂቃ ስንት ቀረኝ",
+        "ስንት ቀረኝ"
+      ]
+    },
+    "buy_package": {
+      "description": "User wants to purchase an internet or voice package",
+      "keywords": [
+        "ጥቅል",
+        "ፓኬጅ",
+        "ደታ ግዛ",
+        "ኢንተርኔት ግዛ",
+        "ጥቅል መግዛት",
+        "ደቂቃ ግዛ",
+        "ጥቅል እፈልጋለሁ"
+      ]
+    },
+    "telebirr_transfer": {
+      "description": "User wants to send money via Telebirr",
+      "keywords": [
+        "ቴሌብር",
+        "ገንዘብ ላክ",
+        "ማስተላለፍ",
+        "ላክልኝ",
+        "ገንዘብ አስተላልፍ",
+        "ትራንስፈር"
+      ]
+    }
+  },
+  "packages": {
+    "data_1gb": {
+      "name": "1GB ኢንተርኔት - 7 ቀናት",
+      "type": "data",
+      "amount": 1,
+      "price": 49
+    },
+    "data_5gb": {
+      "name": "5GB ኢንተርኔት - 30 ቀናት",
+      "type": "data",
+      "amount": 5,
+      "price": 199
+    },
+    "voice_100min": {
+      "name": "100 ደቂቃ የድምጽ ጥቅል",
+      "type": "voice",
+      "amount": 100,
+      "price": 60
+    },
+    "voice_300min": {
+      "name": "300 ደቂቃ የድምጽ ጥቅል",
+      "type": "voice",
+      "amount": 300,
+      "price": 150
+    }
+  },
+  "responses": {
+    "check_balance": "📊 ቀሪ ሂሳብዎ: {balance} ብር | ኢንተርኔት: {data} ጂቢ | ድምጽ: {minutes} ደቂቃ ቀርተዋል።",
+    "package_not_found": "ይቅርታ፣ የተመረጠው ጥቅል አልተገኘም።",
+    "insufficient_balance": "ይቅርታ፣ በቂ ሂሳብ የለዎትም። የአሁኑ ቀሪ ሂሳብ: {balance} ብር።",
+    "package_success": "✅ የ{name} ጥቅል በተሳካ ሁኔታ ተገዝቷል በ{price} ብር። አዲስ ቀሪ ሂሳብ: {balance} ብር።",
+    "invalid_amount": "⚠️ እባክዎ ትክክለኛ የገንዘብ መጠን ያስገቡ።",
+    "invalid_phone": "⚠️ እባክዎ ትክክለኛ የስልክ ቁጥር ያስገቡ (ለምሳሌ 0912345678)።",
+    "telebirr_insufficient": "ይቅርታ፣ በቴሌብር ሒሳብዎ በቂ ገንዘብ የለም። የአሁኑ ቀሪ ሂሳብ: {balance} ብር።",
+    "telebirr_success": "✅ {amount} ብር ወደ {phone} በተሳካ ሁኔታ ተልኳል። የግብይት መለያ: {txn_id}። አዲስ የቴሌብር ቀሪ ሂሳብ: {balance} ብር።",
+    "ask_package_choice": "እባክዎ ከ«ጥቅል ግዢ» ትር ውስጥ የሚፈልጉትን ጥቅል ይምረጡ።",
+    "ask_transfer_details": "እባክዎ ከ«ቴሌብር ማስተላለፍ» ትር ውስጥ የተቀባይ ስልክ ቁጥር እና የገንዘብ መጠን ያስገቡ።",
+    "unknown_intent": "ይቅርታ፣ ትዕዛዝዎን አልተረዳሁትም። እባክዎ እንደገና ይሞክሩ ወይም ከታች ካሉት ትሮች ይምረጡ።"
+  }
+}
