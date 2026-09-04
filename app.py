@@ -9,6 +9,13 @@ import json
 import random
 from datetime import datetime
 
+# Optional real microphone input (browser Web Speech API via streamlit-mic-recorder)
+try:
+    from streamlit_mic_recorder import speech_to_text
+    MIC_AVAILABLE = True
+except ImportError:
+    MIC_AVAILABLE = False
+
 # ---------- Load Configuration ----------
 with open("prompts.json", "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
@@ -98,26 +105,85 @@ def telebirr_transfer(phone, amount):
     )
 
 
-# ---------- UI ----------
+# ---------- Sidebar: Judge / Demo Mode ----------
+with st.sidebar:
+    st.header("🧪 Judge / Test Mode")
+    st.caption("Set custom account values here to test the balance check, "
+               "package purchase, and Telebirr features on demand.")
+
+    sim_balance = st.number_input(
+        "Simulated Airtime Balance (ETB)", min_value=0.0,
+        value=float(st.session_state.balance), step=10.0, format="%.2f"
+    )
+    sim_data = st.number_input(
+        "Simulated Data Balance (GB)", min_value=0.0,
+        value=float(st.session_state.data_balance), step=0.5, format="%.1f"
+    )
+    sim_minutes = st.number_input(
+        "Simulated Voice Minutes", min_value=0,
+        value=int(st.session_state.voice_minutes), step=10
+    )
+    sim_telebirr = st.number_input(
+        "Simulated Telebirr Balance (ETB)", min_value=0.0,
+        value=float(st.session_state.telebirr_balance), step=50.0, format="%.2f"
+    )
+
+    if st.button("✅ Apply Simulated Balance"):
+        st.session_state.balance = sim_balance
+        st.session_state.data_balance = sim_data
+        st.session_state.voice_minutes = sim_minutes
+        st.session_state.telebirr_balance = sim_telebirr
+        st.success("Simulated balances updated!")
+        st.rerun()
+
+    st.markdown("---")
+    if not MIC_AVAILABLE:
+        st.warning(
+            "🎤 Microphone input package not installed.\n\n"
+            "Run: `pip install streamlit-mic-recorder`"
+        )
+
+
+# ---------- Main UI ----------
 st.title("🎙️ EthioVoice AI")
 st.caption(CONFIG["system"]["tagline"])
 
-st.markdown("### 🗣️ የድምጽ ትዕዛዝዎን ይተይቡ (Type your voice command in Amharic)")
-user_input = st.text_input(
-    "ለምሳሌ፦ «ቀሪ ሂሳቤን አሳየኝ» ወይም «ጥቅል መግዛት እፈልጋለሁ»", ""
+st.markdown("### 🗣️ የድምጽ ትዕዛዝዎን ይናገሩ ወይም ይተይቡ (Speak or type your command)")
+
+voice_text = None
+if MIC_AVAILABLE:
+    st.caption("🎤 Tap once to start, tap again to stop. Requires microphone "
+               "permission and works best in Chrome. Needs HTTPS or localhost.")
+    voice_text = speech_to_text(
+        language="am-ET",
+        start_prompt="🎤 መናገር ጀምር (Start Speaking)",
+        stop_prompt="⏹️ አቁም (Stop)",
+        just_once=True,
+        use_container_width=True,
+        key="mic_input",
+    )
+    if voice_text:
+        st.info(f"🗣️ የተያዘ ንግግር (Recognized speech): **{voice_text}**")
+
+typed_input = st.text_input(
+    "ወይም እዚህ ይተይቡ (Or type here) — ለምሳሌ፦ «ቀሪ ሂሳቤን አሳየኝ»",
+    key="typed_input",
 )
 
 col1, col2 = st.columns(2)
 with col1:
-    process_btn = st.button("🎤 ላክ (Send)")
+    process_btn = st.button("➡️ ላክ (Process)")
 with col2:
     clear_btn = st.button("🧹 አጽዳ (Clear)")
 
 if clear_btn:
+    st.session_state.pop("typed_input", None)
     st.rerun()
 
-if process_btn and user_input:
-    intent = detect_intent(user_input)
+final_command = voice_text if voice_text else typed_input
+
+if process_btn and final_command:
+    intent = detect_intent(final_command)
     st.markdown("---")
     if intent == "check_balance":
         st.success(check_balance())
@@ -127,6 +193,8 @@ if process_btn and user_input:
         st.info(CONFIG["responses"]["ask_transfer_details"])
     else:
         st.warning(CONFIG["responses"]["unknown_intent"])
+elif process_btn and not final_command:
+    st.warning("እባክዎ በመጀመሪያ ትዕዛዝ ይናገሩ ወይም ይተይቡ። (Please speak or type a command first.)")
 
 st.markdown("---")
 
