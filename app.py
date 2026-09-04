@@ -1,6 +1,7 @@
 """
 EthioVoice AI — Voice & Text Telecom Assistant
-Now powered by Gemini (gemini-1.5-flash) for NLU, with local fuzzy-matching fallback.
+Now powered by Gemini (with automatic model-selection fallback), with local
+fuzzy-matching fallback if no Gemini model is reachable.
 Run with: streamlit run app.py
 """
 
@@ -89,6 +90,9 @@ defaults = {
     "last_audio_hash": None,
     "prefill_phone": "",
     "prefill_amount": "",
+    # Caches whichever Gemini model most recently answered successfully, so we
+    # don't have to re-probe every candidate on every single command.
+    "gemini_working_model": None,
 }
 for key, val in defaults.items():
     if key not in st.session_state:
@@ -108,11 +112,21 @@ def get_gemini_api_key():
     return os.environ.get("GEMINI_API_KEY", "")
 
 
+# Ordered list of model names to try. The API version / model catalog served
+# to a given key can change (e.g. "gemini-1.5-flash" returning a 404 under
+# v1beta), so we try newer names first and step down through older ones.
+GEMINI_MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-pro"]
+
 GEMINI_API_KEY = get_gemini_api_key()
 GEMINI_READY = bool(GEMINI_API_KEY) and GEMINI_SDK_AVAILABLE
 
 if GEMINI_READY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception:
+        # If configuration itself fails, treat Gemini as unavailable so we
+        # cleanly drop straight to the local fallback NLU.
+        GEMINI_READY = False
 
 GEMINI_SYSTEM_PROMPT = """You are the NLU engine for "EthioVoice AI", a voice assistant for Ethio Telecom and Telebirr users who speak Amharic (including slang, typos, and non-standard spelling).
 
@@ -142,14 +156,22 @@ Always respond in valid JSON only. Never include commentary outside the JSON obj
 """
 
 
-def classify_intent_with_gemini(user_text):
+def _build_model_order():
     """
-    Calls Gemini to classify intent. Returns a dict:
-    {intent, parameters: {package_type, amount, phone_number}, response_amharic, source}
-    Raises an exception on failure (caller should catch and fall back).
+    Return the candidate model list, with whichever model last answered
+    successfully (if any) moved to the front so we don't re-probe stale
+    404s on every command.
     """
+    working = st.session_state.get("gemini_working_model")
+    if working and working in GEMINI_MODEL_CANDIDATES:
+        return [working] + [m for m in GEMINI_MODEL_CANDIDATES if m != working]
+    return list(GEMINI_MODEL_CANDIDATES)
+
+
+def _call_gemini_model(model_name, user_text):
+    """Make a single attempt against one specific Gemini model name. Raises on failure."""
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
+        model_name=model_name,
         system_instruction=GEMINI_SYSTEM_PROMPT,
     )
     result = model.generate_content(
@@ -182,7 +204,41 @@ def classify_intent_with_gemini(user_text):
         },
         "response_amharic": response_amharic,
         "source": "gemini",
+        "model_used": model_name,
     }
+
+
+def classify_intent_with_gemini(user_text):
+    """
+    Calls Gemini to classify intent, trying each candidate model in
+    GEMINI_MODEL_CANDIDATES order (last-known-working model first). If a
+    model name is unavailable for this API version/key (404, deprecated
+    name, etc.) — or fails for any other reason — it is skipped in favor of
+    the next candidate. Only after every candidate has failed is the error
+    raised, which lets the caller (understand_command) drop through to the
+    local fuzzy-matching fallback.
+    """
+    last_error = None
+    for model_name in _build_model_order():
+        try:
+            output = _call_gemini_model(model_name, user_text)
+            st.session_state.gemini_working_model = model_name
+            return output
+        except Exception as e:
+            last_error = e
+            # If the model we thought was working just failed, stop trusting it.
+            if st.session_state.get("gemini_working_model") == model_name:
+                st.session_state.gemini_working_model = None
+            # Whether this was a 404 (model not found / retired under this API
+            # version) or some other transient error, move on and try the
+            # next candidate model name.
+            continue
+
+    # Every candidate model failed — bubble up the last error so the caller
+    # can fall back to local keyword matching.
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("No Gemini model candidates were available to try.")
 
 
 # =========================================================
@@ -278,8 +334,9 @@ def classify_intent_locally(raw_text):
 
 def understand_command(raw_text):
     """
-    Main NLU entry point. Tries Gemini first (if configured), falls back to local
-    fuzzy matching on any failure. Never raises — always returns a usable dict.
+    Main NLU entry point. Tries Gemini first (looping through
+    GEMINI_MODEL_CANDIDATES if configured), falls back to local fuzzy
+    matching on any failure. Never raises — always returns a usable dict.
     """
     if not raw_text or not raw_text.strip():
         return {
@@ -464,7 +521,10 @@ with st.sidebar:
     st.markdown("---")
     st.header("🧠 NLU Engine Status")
     if GEMINI_READY:
-        st.success("✅ Gemini (gemini-1.5-flash) connected")
+        st.success("✅ Gemini connected")
+        st.caption("Model fallback order: " + " → ".join(GEMINI_MODEL_CANDIDATES))
+        if st.session_state.gemini_working_model:
+            st.caption(f"Last successful model: **{st.session_state.gemini_working_model}**")
     elif not GEMINI_SDK_AVAILABLE:
         st.error("`google-generativeai` not installed.\nRun: `pip install google-generativeai`")
     else:
@@ -533,10 +593,14 @@ with tab1:
         params = result.get("parameters", {})
         ai_response = result.get("response_amharic", "")
         source = result.get("source", "unknown")
+        model_used = result.get("model_used")
 
-        badge_label = "🧠 Gemini AI" if source == "gemini" else (
-            "🔁 Local Fallback" if source == "fallback" else "—"
-        )
+        if source == "gemini":
+            badge_label = f"🧠 Gemini AI ({model_used})" if model_used else "🧠 Gemini AI"
+        elif source == "fallback":
+            badge_label = "🔁 Local Fallback"
+        else:
+            badge_label = "—"
         st.markdown(f"<span class='badge-ai'>{badge_label}</span>", unsafe_allow_html=True)
 
         with st.expander("🔍 Debug: NLU Result"):
@@ -579,7 +643,7 @@ with tab1:
             ))
 
         if "error" in result:
-            st.caption(f"⚠️ Gemini call failed, used local fallback. Details: {result['error']}")
+            st.caption(f"⚠️ All Gemini models failed, used local fallback. Details: {result['error']}")
 
 
 # =========================================================
@@ -679,4 +743,4 @@ else:
 st.caption(
     "⚠️ ማሳሰቢያ: ይህ የማሳያ (Demo) ስሪት ነው። ትክክለኛ ገንዘብ አይንቀሳቀስም። / "
     "This is a simulation for demo purposes only — no real transactions occur."
-    )
+)
