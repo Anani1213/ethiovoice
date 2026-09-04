@@ -1,12 +1,14 @@
 """
 EthioVoice AI — Voice & Text Telecom Assistant
-Competition build for Ethio Telecom.
+Now powered by Gemini (gemini-1.5-flash) for NLU, with local fuzzy-matching fallback.
 Run with: streamlit run app.py
 """
 
 import streamlit as st
 import random
 import re
+import os
+import json
 import difflib
 from datetime import datetime
 
@@ -17,6 +19,13 @@ try:
 except ImportError:
     MIC_AVAILABLE = False
 
+# Gemini SDK
+try:
+    import google.generativeai as genai
+    GEMINI_SDK_AVAILABLE = True
+except ImportError:
+    GEMINI_SDK_AVAILABLE = False
+
 UNLIMITED = "ያልተገደበ (Unlimited)"
 
 # =========================================================
@@ -26,9 +35,7 @@ st.set_page_config(page_title="EthioVoice AI", page_icon="🎙️", layout="cent
 
 st.markdown("""
 <style>
-    html, body, [class*="css"]  {
-        font-size: 19px !important;
-    }
+    html, body, [class*="css"]  { font-size: 19px !important; }
     h1 { font-size: 2.1rem !important; }
     h2, h3 { font-size: 1.4rem !important; }
     .stButton > button {
@@ -45,39 +52,25 @@ st.markdown("""
         padding: 0.7em !important;
     }
     .badge-success {
-        display: inline-block;
-        background-color: #d4edda;
-        color: #0b6623;
-        border: 2px solid #0b6623;
-        padding: 10px 18px;
-        border-radius: 12px;
-        font-weight: 700;
-        font-size: 1.1rem;
-        margin-bottom: 8px;
+        display: inline-block; background-color: #d4edda; color: #0b6623;
+        border: 2px solid #0b6623; padding: 10px 18px; border-radius: 12px;
+        font-weight: 700; font-size: 1.1rem; margin-bottom: 8px;
     }
     .badge-error {
-        display: inline-block;
-        background-color: #f8d7da;
-        color: #842029;
-        border: 2px solid #842029;
-        padding: 10px 18px;
-        border-radius: 12px;
-        font-weight: 700;
-        font-size: 1.1rem;
-        margin-bottom: 8px;
+        display: inline-block; background-color: #f8d7da; color: #842029;
+        border: 2px solid #842029; padding: 10px 18px; border-radius: 12px;
+        font-weight: 700; font-size: 1.1rem; margin-bottom: 8px;
+    }
+    .badge-ai {
+        display: inline-block; background-color: #e7f0ff; color: #1a4d99;
+        border: 2px solid #1a4d99; padding: 6px 14px; border-radius: 10px;
+        font-weight: 600; font-size: 0.95rem; margin-bottom: 8px;
     }
     .info-card {
-        background-color: #f5f9ff;
-        border: 2px solid #cfe0f5;
-        border-radius: 14px;
-        padding: 16px;
-        margin-bottom: 10px;
+        background-color: #f5f9ff; border: 2px solid #cfe0f5;
+        border-radius: 14px; padding: 16px; margin-bottom: 10px;
     }
-    .pkg-price {
-        font-size: 1.3rem;
-        font-weight: 800;
-        color: #0b6623;
-    }
+    .pkg-price { font-size: 1.3rem; font-weight: 800; color: #0b6623; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -86,14 +79,16 @@ st.markdown("""
 # SESSION STATE
 # =========================================================
 defaults = {
-    "balance": 125.50,           # ETB airtime
-    "data_balance": 2.3,         # GB (float) or UNLIMITED string
-    "voice_minutes": 45,         # int or UNLIMITED string
+    "balance": 125.50,
+    "data_balance": 2.3,
+    "voice_minutes": 45,
     "sms_balance": 50,
     "telebirr_balance": 850.00,
     "history": [],
     "recognized_text": "",
     "last_audio_hash": None,
+    "prefill_phone": "",
+    "prefill_amount": "",
 }
 for key, val in defaults.items():
     if key not in st.session_state:
@@ -101,7 +96,97 @@ for key, val in defaults.items():
 
 
 # =========================================================
-# NORMALIZATION (handles typos, slang, spelling variants)
+# GEMINI SETUP
+# =========================================================
+def get_gemini_api_key():
+    """Safely fetch the key from Streamlit secrets first, then environment."""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        pass  # st.secrets not configured — that's fine, fall through
+    return os.environ.get("GEMINI_API_KEY", "")
+
+
+GEMINI_API_KEY = get_gemini_api_key()
+GEMINI_READY = bool(GEMINI_API_KEY) and GEMINI_SDK_AVAILABLE
+
+if GEMINI_READY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+GEMINI_SYSTEM_PROMPT = """You are the NLU engine for "EthioVoice AI", a voice assistant for Ethio Telecom and Telebirr users who speak Amharic (including slang, typos, and non-standard spelling).
+
+Classify the user's message into EXACTLY one of these intents:
+- "CHECK_BALANCE": user wants to check airtime, data, minutes, or SMS balance (like dialing *804#)
+- "BUY_PACKAGE": user wants to buy an internet/data or voice/combo package
+- "TRANSFER_TELEBIRR": user wants to send money via Telebirr
+- "UNKNOWN": the message is ambiguous, unrelated, or unclear
+
+Also extract any relevant parameters mentioned, such as:
+- "package_type": e.g. "ዳታ", "ደቂቃ", "ኮምቦ", "ሳምንታዊ", "ወርሃዊ", "ቀናዊ" (only if clearly mentioned)
+- "amount": a numeric ETB amount, if mentioned (for transfers or purchases)
+- "phone_number": a phone number, if mentioned (for transfers)
+
+Respond ONLY with valid JSON in this exact shape, with no extra text, no markdown fences:
+{
+  "intent": "CHECK_BALANCE | BUY_PACKAGE | TRANSFER_TELEBIRR | UNKNOWN",
+  "parameters": {
+    "package_type": "string or null",
+    "amount": "number or null",
+    "phone_number": "string or null"
+  },
+  "response_amharic": "A short, polite, natural Amharic sentence confirming what you understood, or asking a polite clarifying question if the intent is UNKNOWN."
+}
+
+Always respond in valid JSON only. Never include commentary outside the JSON object.
+"""
+
+
+def classify_intent_with_gemini(user_text):
+    """
+    Calls Gemini to classify intent. Returns a dict:
+    {intent, parameters: {package_type, amount, phone_number}, response_amharic, source}
+    Raises an exception on failure (caller should catch and fall back).
+    """
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        system_instruction=GEMINI_SYSTEM_PROMPT,
+    )
+    result = model.generate_content(
+        user_text,
+        generation_config={
+            "temperature": 0.2,
+            "response_mime_type": "application/json",
+        },
+    )
+
+    raw_text = result.text.strip()
+    # Defensive cleanup in case the model wraps output in markdown fences anyway
+    raw_text = re.sub(r"^```(json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
+
+    parsed = json.loads(raw_text)
+
+    intent = str(parsed.get("intent", "UNKNOWN")).upper()
+    if intent not in ("CHECK_BALANCE", "BUY_PACKAGE", "TRANSFER_TELEBIRR", "UNKNOWN"):
+        intent = "UNKNOWN"
+
+    params = parsed.get("parameters") or {}
+    response_amharic = parsed.get("response_amharic") or ""
+
+    return {
+        "intent": intent,
+        "parameters": {
+            "package_type": params.get("package_type"),
+            "amount": params.get("amount"),
+            "phone_number": params.get("phone_number"),
+        },
+        "response_amharic": response_amharic,
+        "source": "gemini",
+    }
+
+
+# =========================================================
+# LOCAL FALLBACK NLU (fuzzy keyword matching)
 # =========================================================
 AMHARIC_NORMALIZATION_MAP = {
     "ሒ": "ሂ", "ሓ": "ሀ", "ኅ": "ህ", "ሑ": "ሁ", "ኁ": "ሁ",
@@ -111,6 +196,22 @@ AMHARIC_NORMALIZATION_MAP = {
     "ዓ": "ኣ", "ዔ": "ኤ", "ዕ": "እ", "ዖ": "ኦ", "ፀ": "ጸ",
     "ፁ": "ጹ", "ፂ": "ጺ", "ፃ": "ጻ", "ፄ": "ጼ", "ፅ": "ጽ",
     "ፆ": "ጾ", "ፓኬጂ": "ፓኬጅ",
+}
+
+INTENT_KEYWORDS = {
+    "CHECK_BALANCE": ["ቀሪ", "ሂሳብ", "ሒሳብ", "ብር", "ስንት አለኝ", "ያለኝ", "balance", "804"],
+    "BUY_PACKAGE": ["ፓኬጅ", "ፓኬጂ", "ጥቅል", "ኢንተርኔት", "ዳታ", "ደቂቃ",
+                    "ሳምንታዊ", "ወርሃዊ", "package", "bundle"],
+    "TRANSFER_TELEBIRR": ["ላክ", "መላክ", "ትራንስፈር", "ቴሌብር", "ገንዘብ", "send", "transfer"],
+}
+
+FALLBACK_RESPONSES = {
+    "CHECK_BALANCE": "ቀሪ ሂሳብዎን እያሳየሁ ነው።",
+    "BUY_PACKAGE": "ጥቅል ለመግዛት እየረዳሁዎት ነው። እባክዎ ከፓኬጅ ዝርዝር ትር ውስጥ ይምረጡ።",
+    "TRANSFER_TELEBIRR": "ገንዘብ ለማስተላለፍ እየረዳሁዎት ነው። እባክዎ ዝርዝሮችን ያስገቡ።",
+    "AMBIGUOUS": "ትእዛዝዎ ከአንድ በላይ አገልግሎት ጋር ይመሳሰላል። እባክዎ በግልጽ ይንገሩኝ።",
+    "UNKNOWN": "ይቅርታ፣ በትክክል አልተረዳሁትም። 'ቀሪ ሂሳብ አሳየኝ'፣ 'ጥቅል መግዛት እፈልጋለሁ'፣ ወይም 'ገንዘብ ላክ' ብለው ይሞክሩ።",
+    "EMPTY": "እባክዎ በመጀመሪያ ይናገሩ ወይም ይተይቡ።",
 }
 
 
@@ -125,57 +226,76 @@ def normalize_text(text):
     return text
 
 
-# =========================================================
-# INTENT KEYWORDS + FUZZY MATCHING
-# =========================================================
-INTENT_KEYWORDS = {
-    "check_balance": [
-        "ቀሪ", "ሂሳብ", "ሒሳብ", "ብር", "ስንት አለኝ", "ያለኝ", "balance", "804"
-    ],
-    "buy_package": [
-        "ፓኬጅ", "ፓኬጂ", "ጥቅል", "ኢንተርኔት", "ዳታ", "ደቂቃ",
-        "ሳምንታዊ", "ወርሃዊ", "package", "bundle"
-    ],
-    "telebirr_transfer": [
-        "ላክ", "መላክ", "ትራንስፈር", "ቴሌብር", "ገንዘብ", "send", "transfer"
-    ],
-}
-
-FUZZY_THRESHOLD = 0.78  # similarity ratio for typo tolerance
-
-
-def keyword_matches(keyword, normalized_text):
-    """Exact substring match first, then per-word fuzzy match for typos/accents."""
+def keyword_matches(keyword, normalized_text, threshold=0.78):
     norm_keyword = normalize_text(keyword)
     if norm_keyword in normalized_text:
         return True
     for word in normalized_text.split():
-        if difflib.SequenceMatcher(None, word, norm_keyword).ratio() >= FUZZY_THRESHOLD:
+        if difflib.SequenceMatcher(None, word, norm_keyword).ratio() >= threshold:
             return True
     return False
 
 
-def detect_intent(raw_text):
-    """
-    Returns (intent, matched_intents_list).
-    intent is one of: check_balance, buy_package, telebirr_transfer,
-                       'ambiguous', 'unknown'
-    """
+def classify_intent_locally(raw_text):
+    """Fallback NLU used when Gemini is unavailable or fails. Same output shape as Gemini path."""
     normalized = normalize_text(raw_text)
     if not normalized:
-        return "unknown", []
+        return {
+            "intent": "UNKNOWN", "parameters": {}, "response_amharic": FALLBACK_RESPONSES["EMPTY"],
+            "source": "fallback",
+        }
 
-    matched = []
-    for intent, keywords in INTENT_KEYWORDS.items():
-        if any(keyword_matches(k, normalized) for k in keywords):
-            matched.append(intent)
+    matched = [
+        intent for intent, kws in INTENT_KEYWORDS.items()
+        if any(keyword_matches(k, normalized) for k in kws)
+    ]
 
     if len(matched) == 1:
-        return matched[0], matched
+        intent = matched[0]
+        response = FALLBACK_RESPONSES[intent]
     elif len(matched) > 1:
-        return "ambiguous", matched
+        intent = "UNKNOWN"
+        response = FALLBACK_RESPONSES["AMBIGUOUS"]
     else:
-        return "unknown", []
+        intent = "UNKNOWN"
+        response = FALLBACK_RESPONSES["UNKNOWN"]
+
+    # Very light parameter extraction: grab a phone number and an amount if present
+    phone_match = re.search(r"09\d{8}|9\d{8}", normalized)
+    amount_match = re.search(r"\b(\d{2,6})\b", normalized)
+
+    return {
+        "intent": intent,
+        "parameters": {
+            "package_type": None,
+            "amount": float(amount_match.group(1)) if amount_match else None,
+            "phone_number": phone_match.group(0) if phone_match else None,
+        },
+        "response_amharic": response,
+        "source": "fallback",
+    }
+
+
+def understand_command(raw_text):
+    """
+    Main NLU entry point. Tries Gemini first (if configured), falls back to local
+    fuzzy matching on any failure. Never raises — always returns a usable dict.
+    """
+    if not raw_text or not raw_text.strip():
+        return {
+            "intent": "UNKNOWN", "parameters": {}, "response_amharic": FALLBACK_RESPONSES["EMPTY"],
+            "source": "none",
+        }
+
+    if GEMINI_READY:
+        try:
+            return classify_intent_with_gemini(raw_text)
+        except Exception as e:
+            result = classify_intent_locally(raw_text)
+            result["error"] = str(e)
+            return result
+    else:
+        return classify_intent_locally(raw_text)
 
 
 # =========================================================
@@ -264,25 +384,21 @@ def buy_package(category, pkg_id):
     if st.session_state.balance < pkg["price"]:
         return False, (
             f"⚠️ በቂ ሂሳብ የለዎትም። የ{pkg['name']} ዋጋ {pkg['price']} ብር ሲሆን "
-            f"የአሁኑ ቀሪ ሂሳብዎ {st.session_state.balance:.2f} ብር ብቻ ነው። "
-            f"እባክዎ አየር ሰዓት ይሙሉ።"
+            f"የአሁኑ ቀሪ ሂሳብዎ {st.session_state.balance:.2f} ብር ብቻ ነው። እባክዎ አየር ሰዓት ይሙሉ።"
         )
 
     st.session_state.balance -= pkg["price"]
 
-    # Data
     if pkg.get("unlimited_data"):
         st.session_state.data_balance = UNLIMITED
     elif pkg.get("data_mb") and st.session_state.data_balance != UNLIMITED:
         st.session_state.data_balance += pkg["data_mb"] / 1024
 
-    # Minutes
     if pkg.get("unlimited_minutes"):
         st.session_state.voice_minutes = UNLIMITED
     elif pkg.get("minutes") and st.session_state.voice_minutes != UNLIMITED:
         st.session_state.voice_minutes += pkg["minutes"]
 
-    # SMS
     if pkg.get("sms"):
         st.session_state.sms_balance += pkg["sms"]
 
@@ -308,8 +424,7 @@ def telebirr_transfer(phone, amount_str):
         return False, "⚠️ የሚላከው መጠን ከዜሮ በላይ መሆን አለበት።"
     if amount > st.session_state.telebirr_balance:
         return False, (
-            f"⚠️ በቴሌብር ሂሳብዎ በቂ ገንዘብ የለም። "
-            f"የአሁኑ ቀሪ ሂሳብ: {st.session_state.telebirr_balance:.2f} ብር።"
+            f"⚠️ በቴሌብር ሂሳብዎ በቂ ገንዘብ የለም። የአሁኑ ቀሪ ሂሳብ: {st.session_state.telebirr_balance:.2f} ብር።"
         )
 
     st.session_state.telebirr_balance -= amount
@@ -347,10 +462,22 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
+    st.header("🧠 NLU Engine Status")
+    if GEMINI_READY:
+        st.success("✅ Gemini (gemini-1.5-flash) connected")
+    elif not GEMINI_SDK_AVAILABLE:
+        st.error("`google-generativeai` not installed.\nRun: `pip install google-generativeai`")
+    else:
+        st.warning(
+            "⚠️ No GEMINI_API_KEY found. Using local fuzzy-matching fallback.\n\n"
+            "Add it via `st.secrets['GEMINI_API_KEY']` or the `GEMINI_API_KEY` "
+            "environment variable to enable Gemini."
+        )
+
     if not MIC_AVAILABLE:
         st.warning("🎤 Voice input needs: `pip install streamlit-mic-recorder`")
 
-    with st.expander("🔍 Debug: Intent Keywords"):
+    with st.expander("🔍 Debug: Fallback Keywords"):
         for intent, kws in INTENT_KEYWORDS.items():
             st.caption(f"**{intent}**: {', '.join(kws)}")
 
@@ -359,7 +486,7 @@ with st.sidebar:
 # MAIN HEADER
 # =========================================================
 st.title("🎙️ EthioVoice AI")
-st.caption("Voice & Text Telecom Assistant — ለሁሉም ተደራሽ የኢትዮ ቴሌኮም ረዳት")
+st.caption("Voice & Text Telecom Assistant — powered by Gemini NLU")
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "🎙️ የድምፅ/ጽሁፍ ትእዛዝ",
@@ -399,43 +526,60 @@ with tab1:
     final_command = voice_text if voice_text else typed_text
 
     if process:
+        with st.spinner("🧠 ትእዛዝዎን በመተንተን ላይ... (Understanding your command...)"):
+            result = understand_command(final_command)
+
+        intent = result["intent"]
+        params = result.get("parameters", {})
+        ai_response = result.get("response_amharic", "")
+        source = result.get("source", "unknown")
+
+        badge_label = "🧠 Gemini AI" if source == "gemini" else (
+            "🔁 Local Fallback" if source == "fallback" else "—"
+        )
+        st.markdown(f"<span class='badge-ai'>{badge_label}</span>", unsafe_allow_html=True)
+
+        with st.expander("🔍 Debug: NLU Result"):
+            st.json(result)
+
+        st.markdown("---")
+
         if not final_command:
-            st.markdown("<span class='badge-error'>እባክዎ በመጀመሪያ ይናገሩ ወይም ይተይቡ።</span>",
-                        unsafe_allow_html=True)
-        else:
-            intent, matched = detect_intent(final_command)
+            st.markdown(f"<span class='badge-error'>{ai_response}</span>", unsafe_allow_html=True)
 
-            with st.expander("🔍 Debug: Matching Details"):
-                st.text(f"Raw: {final_command}")
-                st.text(f"Normalized: {normalize_text(final_command)}")
-                st.text(f"Matched intents: {matched}")
-                st.text(f"Final intent: {intent}")
+        elif intent == "CHECK_BALANCE":
+            st.markdown("<span class='badge-success'>✅ ቀሪ ሂሳብ ተገኝቷል</span>", unsafe_allow_html=True)
+            if ai_response:
+                st.markdown(f"🗣️ *{ai_response}*")
+            st.markdown(check_balance_text())
 
-            st.markdown("---")
-            if intent == "check_balance":
-                st.markdown("<span class='badge-success'>✅ ቀሪ ሂሳብ ተገኝቷል</span>", unsafe_allow_html=True)
-                st.markdown(check_balance_text())
+        elif intent == "BUY_PACKAGE":
+            st.info(f"🗣️ {ai_response}" if ai_response else
+                    "📦 ጥቅል መግዛት ይፈልጋሉ። እባክዎ ከ«📦 የፓኬጅ ዝርዝሮች» ትር ውስጥ ይምረጡ።")
+            if params.get("package_type"):
+                st.caption(f"🔎 የተጠቀሰ ዓይነት፦ {params['package_type']} — ከፓኬጅ ትር ውስጥ ተመሳሳይ ጥቅል ይምረጡ።")
 
-            elif intent == "buy_package":
-                st.info("📦 ጥቅል መግዛት ይፈልጋሉ። እባክዎ ከ«📦 የፓኬጅ ዝርዝሮች» ትር ውስጥ የሚፈልጉትን ጥቅል ይምረጡ።")
+        elif intent == "TRANSFER_TELEBIRR":
+            st.info(f"🗣️ {ai_response}" if ai_response else
+                    "💸 ገንዘብ ማስተላለፍ ይፈልጋሉ። እባክዎ ከ«💸 ቴሌብር ማስተላለፊያ» ትር ውስጥ ዝርዝሮችን ያስገቡ።")
+            # Pre-fill the transfer tab if Gemini/fallback extracted phone/amount
+            if params.get("phone_number"):
+                st.session_state.prefill_phone = str(params["phone_number"])
+            if params.get("amount"):
+                st.session_state.prefill_amount = str(params["amount"])
+            if params.get("phone_number") or params.get("amount"):
+                st.caption("✅ ስልክ ቁጥር/መጠን ወደ ቴሌብር ትር ተቀድቷል።")
 
-            elif intent == "telebirr_transfer":
-                st.info("💸 ገንዘብ ማስተላለፍ ይፈልጋሉ። እባክዎ ከ«💸 ቴሌብር ማስተላለፊያ» ትር ውስጥ ዝርዝሮችን ያስገቡ።")
+        else:  # UNKNOWN
+            st.warning(ai_response or (
+                "😕 ይቅርታ፣ በትክክል አልተረዳሁትም። እባክዎ በሚከተለው መልኩ ይሞክሩ፦\n\n"
+                "- «ቀሪ ሂሳቤን አሳየኝ» (ለቀሪ ሂሳብ)\n"
+                "- «ጥቅል መግዛት እፈልጋለሁ» (ለፓኬጅ ግዢ)\n"
+                "- «ገንዘብ ወደ ቴሌብር ላክ» (ለቴሌብር ማስተላለፍ)"
+            ))
 
-            elif intent == "ambiguous":
-                readable = " / ".join(matched)
-                st.warning(
-                    f"🤔 ትእዛዝዎ ከአንድ በላይ አገልግሎት ጋር ይመሳሰላል ({readable})። "
-                    f"እባክዎ በግልጽ ይናገሩ፦ 'ቀሪ ሂሳብ አሳየኝ'፣ 'ጥቅል መግዛት እፈልጋለሁ'፣ ወይም 'ገንዘብ ላክ'።"
-                )
-
-            else:
-                st.warning(
-                    "😕 ይቅርታ፣ በትክክል አልተረዳሁትም። እባክዎ በሚከተለው መልኩ ይሞክሩ፦\n\n"
-                    "- «ቀሪ ሂሳቤን አሳየኝ» (ለቀሪ ሂሳብ)\n"
-                    "- «ጥቅል መግዛት እፈልጋለሁ» (ለፓኬጅ ግዢ)\n"
-                    "- «ገንዘብ ወደ ቴሌብር ላክ» (ለቴሌብር ማስተላለፍ)"
-                )
+        if "error" in result:
+            st.caption(f"⚠️ Gemini call failed, used local fallback. Details: {result['error']}")
 
 
 # =========================================================
@@ -465,36 +609,35 @@ with tab3:
                              format_func=lambda c: CATEGORY_LABELS[c])
 
     for pkg in PACKAGES[category]:
-        with st.container():
-            st.markdown(f"<div class='info-card'>", unsafe_allow_html=True)
-            colA, colB = st.columns([3, 1])
-            with colA:
-                st.markdown(f"**{pkg['name']}**")
-                details = []
-                if pkg.get("unlimited_data"):
-                    details.append(f"ዳታ: {UNLIMITED}")
-                elif pkg.get("data_mb"):
-                    details.append(f"ዳታ: {format_data(pkg['data_mb'])}")
-                if pkg.get("unlimited_minutes"):
-                    details.append(f"ደቂቃ: {UNLIMITED}")
-                elif pkg.get("minutes"):
-                    details.append(f"ደቂቃ: {pkg['minutes']}")
-                if pkg.get("sms"):
-                    details.append(f"ኤስኤምኤስ: {pkg['sms']}")
-                details.append(f"ልክነት: {pkg['validity']}")
-                st.caption(" | ".join(details))
-                st.markdown(f"<span class='pkg-price'>{pkg['price']} ብር</span>", unsafe_allow_html=True)
-            with colB:
-                if st.button("ግዛ", key=f"buy_{pkg['id']}"):
-                    success, msg = buy_package(category, pkg["id"])
-                    if success:
-                        st.markdown("<span class='badge-success'>✅ ተሳክቷል!</span>", unsafe_allow_html=True)
-                        st.markdown(msg)
-                        st.rerun()
-                    else:
-                        st.markdown("<span class='badge-error'>❌ አልተሳካም</span>", unsafe_allow_html=True)
-                        st.markdown(msg)
-            st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='info-card'>", unsafe_allow_html=True)
+        colA, colB = st.columns([3, 1])
+        with colA:
+            st.markdown(f"**{pkg['name']}**")
+            details = []
+            if pkg.get("unlimited_data"):
+                details.append(f"ዳታ: {UNLIMITED}")
+            elif pkg.get("data_mb"):
+                details.append(f"ዳታ: {format_data(pkg['data_mb'])}")
+            if pkg.get("unlimited_minutes"):
+                details.append(f"ደቂቃ: {UNLIMITED}")
+            elif pkg.get("minutes"):
+                details.append(f"ደቂቃ: {pkg['minutes']}")
+            if pkg.get("sms"):
+                details.append(f"ኤስኤምኤስ: {pkg['sms']}")
+            details.append(f"ልክነት: {pkg['validity']}")
+            st.caption(" | ".join(details))
+            st.markdown(f"<span class='pkg-price'>{pkg['price']} ብር</span>", unsafe_allow_html=True)
+        with colB:
+            if st.button("ግዛ", key=f"buy_{pkg['id']}"):
+                success, msg = buy_package(category, pkg["id"])
+                if success:
+                    st.markdown("<span class='badge-success'>✅ ተሳክቷል!</span>", unsafe_allow_html=True)
+                    st.markdown(msg)
+                    st.rerun()
+                else:
+                    st.markdown("<span class='badge-error'>❌ አልተሳካም</span>", unsafe_allow_html=True)
+                    st.markdown(msg)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 # =========================================================
@@ -504,14 +647,18 @@ with tab4:
     st.subheader("💸 ቴሌብር ማስተላለፊያ")
     st.metric("💳 የአሁኑ ቴሌብር ቀሪ ሂሳብ", f"{st.session_state.telebirr_balance:.2f} ብር")
 
-    phone_number = st.text_input("📱 የተቀባይ ስልክ ቁጥር", placeholder="0912345678")
-    amount = st.text_input("💰 የሚላከው መጠን (ብር)", placeholder="ለምሳሌ 100")
+    phone_number = st.text_input("📱 የተቀባይ ስልክ ቁጥር", value=st.session_state.prefill_phone,
+                                  placeholder="0912345678")
+    amount = st.text_input("💰 የሚላከው መጠን (ብር)", value=st.session_state.prefill_amount,
+                            placeholder="ለምሳሌ 100")
 
     if st.button("➡️ ገንዘብ ላክ (Send Money)"):
         success, msg = telebirr_transfer(phone_number, amount)
         if success:
             st.markdown("<span class='badge-success'>✅ ግብይት ተሳክቷል!</span>", unsafe_allow_html=True)
             st.markdown(msg)
+            st.session_state.prefill_phone = ""
+            st.session_state.prefill_amount = ""
             st.rerun()
         else:
             st.markdown("<span class='badge-error'>❌ ግብይት አልተሳካም</span>", unsafe_allow_html=True)
@@ -519,7 +666,7 @@ with tab4:
 
 
 # =========================================================
-# ACTIVITY HISTORY (shown on every tab visit, at bottom)
+# ACTIVITY HISTORY
 # =========================================================
 st.markdown("---")
 st.markdown("### 🕒 የቅርብ ጊዜ እንቅስቃሴ (Recent Activity)")
