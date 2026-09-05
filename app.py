@@ -7,12 +7,11 @@ Run with: streamlit run app.py
 """
 
 import streamlit as st
-import base64
 import os
-import re
+from PIL import Image
 
 try:
-    from openai import OpenAI
+    import google.generativeai as genai
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
@@ -49,27 +48,24 @@ st.markdown("""
 def _get_backend_key():
     """Fetch the backend credential from Streamlit secrets first, then environment."""
     try:
-        if "OPENAI_API_KEY" in st.secrets:
-            return st.secrets["OPENAI_API_KEY"]
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
     except Exception:
         pass
-    return os.environ.get("OPENAI_API_KEY", "")
+    return os.environ.get("GEMINI_API_KEY", "")
 
 
 _BACKEND_KEY = _get_backend_key()
 SYSTEM_READY = bool(_BACKEND_KEY) and SDK_AVAILABLE
 
-_client = None
+_model = None
 if SYSTEM_READY:
     try:
-        _client = OpenAI(api_key=_BACKEND_KEY)
+        genai.configure(api_key=_BACKEND_KEY)
+        _model = genai.GenerativeModel('gemini-1.5-flash')
     except Exception:
         SYSTEM_READY = False
-        _client = None
-
-# Tried in order; if the first is unavailable for this account/key, the
-# second is used automatically. Never shown in the UI.
-_MODEL_CANDIDATES = ["gpt-4o-mini", "gpt-4o"]
+        _model = None
 
 FORENSIC_SYSTEM_PROMPT = (
     "You are an expert Telebirr forensic transaction analyzer. Inspect this "
@@ -84,47 +80,15 @@ GENERIC_ERROR_MESSAGE = (
 )
 
 
-def _encode_image_to_base64(uploaded_file):
-    """Convert an uploaded image file's raw bytes into a base64 string."""
-    file_bytes = uploaded_file.getvalue()
-    return base64.b64encode(file_bytes).decode("utf-8")
-
-
 def _analyze_receipt(uploaded_file):
     """
-    Sends the receipt image, alongside the forensic system prompt, to the
-    backend for analysis. Tries each candidate model in turn; raises only
-    after every candidate has failed, so the caller can show one clean
-    Amharic error message with no technical detail exposed.
+    Sends the receipt image, alongside the forensic prompt, to the backend
+    for analysis. Any failure is raised up to the caller, which shows one
+    clean Amharic error message with no technical detail exposed.
     """
-    b64_image = _encode_image_to_base64(uploaded_file)
-    mime_type = uploaded_file.type or "image/jpeg"
-    data_url = f"data:{mime_type};base64,{b64_image}"
-
-    last_error = None
-    for model_name in _MODEL_CANDIDATES:
-        try:
-            response = _client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": FORENSIC_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "ይህን የቴሌብር ደረሰኝ ስክሪንሾት በጥንቃቄ መርምር።"},
-                            {"type": "image_url", "image_url": {"url": data_url}},
-                        ],
-                    },
-                ],
-                max_tokens=800,
-                temperature=0.2,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            last_error = e
-            continue
-
-    raise last_error if last_error is not None else RuntimeError("Analysis unavailable")
+    image = Image.open(uploaded_file)
+    response = _model.generate_content([FORENSIC_SYSTEM_PROMPT, image])
+    return response.text.strip()
 
 
 def _parse_verdict_and_score(analysis_text):
@@ -133,6 +97,7 @@ def _parse_verdict_and_score(analysis_text):
     score (0-100) from the free-form Amharic analysis text, for the
     st.metric summary cards.
     """
+    import re
     score_match = re.search(r"(\d{1,3})\s*%", analysis_text)
     score = None
     if score_match:
@@ -207,8 +172,8 @@ if analyze_clicked:
                 st.markdown(analysis_text)
                 st.markdown("</div>", unsafe_allow_html=True)
 
-            except Exception as e:
-                st.error(f"የምስል ምርመራው ላይ ጊዜያዊ ችግር አጋጥሟል... Debug Info: {str(e)}")
+            except Exception:
+                st.error(GENERIC_ERROR_MESSAGE)
 
 st.markdown("---")
 st.caption(
