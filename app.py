@@ -1,152 +1,479 @@
-import streamlit as st
+"""
+Telebirr FraudShield — Offline & USSD Hybrid Edition
+-----------------------------------------------------
+A fully local, rule-based SMS/transaction forensic inspector and USSD
+simulator built for the Ethio Telecom Innovation Challenge.
+
+No external AI services, no API keys, no network calls of any kind.
+Every decision is made with plain Python string/regex heuristics.
+"""
+
+import html
 import re
 
-# Page Configuration
+import streamlit as st
+
+# ---------------------------------------------------------------------------
+# PAGE CONFIGURATION
+# ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Telebirr FraudShield AI",
+    page_title="Telebirr FraudShield",
     page_icon="🛡️",
-    layout="centered"
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-# Custom Styling & White-Labeling
-st.markdown("""
+# ---------------------------------------------------------------------------
+# GLOBAL STYLING
+# ---------------------------------------------------------------------------
+st.markdown(
+    """
     <style>
-    .main-title { font-size: 24px; font-weight: bold; color: #1E3A8A; margin-bottom: 0px; }
-    .sub-text { font-size: 13px; color: #4B5563; margin-bottom: 15px; }
-    .ussd-screen { background-color: #111827; color: #10B981; padding: 20px; border-radius: 10px; font-family: monospace; font-size: 15px; border: 2px solid #374151; }
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+
+        .main-header {
+            background: linear-gradient(90deg, #0a5c36 0%, #128a4a 100%);
+            padding: 1.4rem 1.8rem;
+            border-radius: 14px;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+        }
+        .main-header h1 {
+            color: #ffffff;
+            margin: 0;
+            font-size: 1.9rem;
+        }
+        .main-header p {
+            color: #e6f4ea;
+            margin: 0.35rem 0 0 0;
+            font-size: 0.95rem;
+        }
+
+        .verdict-safe {
+            background-color: #e6f6ea;
+            border-left: 8px solid #1e8e3e;
+            color: #145a24;
+            padding: 1rem 1.2rem;
+            border-radius: 10px;
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-bottom: 0.6rem;
+        }
+        .verdict-fraud {
+            background-color: #fce8e6;
+            border-left: 8px solid #c5221f;
+            color: #7a1210;
+            padding: 1rem 1.2rem;
+            border-radius: 10px;
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-bottom: 0.6rem;
+        }
+
+        .ussd-phone {
+            background: #161616;
+            border-radius: 26px;
+            padding: 22px;
+            max-width: 380px;
+            margin: 0.5rem auto 1.2rem auto;
+            box-shadow: 0 0 0 6px #2b2b2b, 0 10px 30px rgba(0,0,0,0.4);
+        }
+        .ussd-header {
+            text-align: center;
+            color: #9aa39a;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+            margin-bottom: 10px;
+            font-family: 'Courier New', monospace;
+        }
+        .ussd-screen {
+            background: #0a1f0f;
+            color: #3cff5e;
+            font-family: 'Courier New', monospace;
+            font-size: 1rem;
+            line-height: 1.55;
+            padding: 18px;
+            border-radius: 6px;
+            min-height: 260px;
+            white-space: pre-wrap;
+            border: 1px solid #1f4d2a;
+        }
     </style>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-st.markdown('<p class="main-title">🛡️ Telebirr FraudShield AI</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-text">ለስማርት እና ለጠቅጠቅ ስልኮች የተዘጋጀ ሁለገብ የደህንነት እና የማጭበርበሪያ መለያ ሲስተም</p>', unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# LOCAL FORENSIC RULE ENGINE (no external services — pure Python heuristics)
+# ---------------------------------------------------------------------------
+RED_FLAG_CATEGORIES = [
+    {
+        "name": "የማባበያ/ሽልማት ቃላት",
+        "keywords": [
+            "አሸንፈዋል", "ሽልማት", "በነፃ", "ነፃ ስጦታ", "እድለኛ ተጠቃሚ",
+            "ኮድ ገብተው ያሸንፉ", "bonus", "winner", "free gift", "lottery",
+        ],
+        "weight": 25,
+    },
+    {
+        "name": "የአስቸኳይ ጊዜ ማስፈራሪያ",
+        "keywords": [
+            "አሁኑኑ", "ወዲያውኑ", "በአስቸኳይ", "ይታገዳል", "ይዘጋል",
+            "የመጨረሻ ማስጠንቀቂያ", "expire", "24 ሰዓት", "ካልሆነ",
+        ],
+        "weight": 15,
+    },
+    {
+        "name": "የፒን/የይለፍ ቃል ጥያቄ",
+        "keywords": ["ፒን", "ፒንዎን", "የይለፍ ቃል", "password", "pin code", "otp"],
+        "weight": 35,
+    },
+    {
+        "name": "አጠራጣሪ ሊንክ",
+        "keywords": [
+            "t.me/", "bit.ly", "tinyurl", "wa.me/", "http://", "https://",
+            "ሊንኩን", "ሊንክ ይጫኑ", ".xyz", ".click",
+        ],
+        "weight": 25,
+    },
+]
 
-# Tabs for Smart Phone vs Feature Phone (USSD)
-tab1, tab2 = st.tabs(["📱 ስማርት ስፎን (SMS መርማሪ)", "📟 ጠቅጠቅ ስልክ (USSD ማስመሰያ)"])
+PERSONAL_NUMBER_PATTERN = re.compile(r"\b(09|07)\d{8}\b")
+OFFICIAL_SHORTCODES = ["127", "9014", "8000", "9800"]
+TX_ID_PATTERN = re.compile(r"\bTR[0-9A-Z]{6,14}\b", re.IGNORECASE)
+TRANSACTION_CONTEXT_WORDS = [
+    "ግብይት", "ብር ደርሶዎታል", "ደርሶታል", "ተልኳል", "ቀሪ ሂሳብ",
+    "balance", "transaction", "ተቀብለዋል",
+]
 
+SAMPLE_REAL = (
+    "የ1,500.00 ብር ክፍያ ለ Global Insurance PLC በተሳካ ሁኔታ ተልኳል። "
+    "የግብይት መለያ ቁጥር: TR251A8B9C21። አዲሱ ቀሪ ሂሳብዎ: 3,240.50 ብር። "
+    "እናመሰግናለን - telebirr (127)"
+)
+
+SAMPLE_FAKE = (
+    "እንኳን ደስ አለዎት! በዛሬው እጣ 50,000 ብር አሸንፈዋል! ሽልማትዎን አሁኑኑ ለመቀበል "
+    "የፒን ቁጥርዎን በዚህ ሊንክ ያስገቡ፡ t.me/telebirr_bonus2026 "
+    "ይህ እድል በ24 ሰዓት ውስጥ ያበቃል! ለበለጠ መረጃ በ0912345678 ይደውሉ።"
+)
+
+
+def analyze_sms(text: str):
+    """Run the local rule-based forensic engine over a message.
+
+    Returns a dict with a 0-100 risk score, a verdict, and a list of
+    human-readable findings — or None if there is nothing to analyze.
+    """
+    if not text or not text.strip():
+        return None
+
+    risk = 0
+    findings = []
+    lowered = text.lower()
+
+    # 1. Keyword category scan
+    for category in RED_FLAG_CATEGORIES:
+        hits = [kw for kw in category["keywords"] if kw.lower() in lowered]
+        if hits:
+            risk += category["weight"]
+            sample_hits = ", ".join(hits[:3])
+            findings.append({
+                "type": "negative",
+                "text": f"{category['name']} ተገኝቷል፦ \u201c{sample_hits}\u201d",
+            })
+
+    # 2. Personal phone number instead of an official shortcode
+    if PERSONAL_NUMBER_PATTERN.search(text):
+        risk += 15
+        findings.append({
+            "type": "negative",
+            "text": "መልእክቱ ወደ ግል ስልክ ቁጥር (09/07) ጥሪ እንዲደረግ ይጠይቃል",
+        })
+
+    if any(code in text for code in OFFICIAL_SHORTCODES):
+        risk = max(risk - 10, 0)
+        findings.append({
+            "type": "positive",
+            "text": "ኦፊሴላዊ የ telebirr አጭር ኮድ ማጣቀሻ ተገኝቷል",
+        })
+
+    # 3. Transaction ID pattern validation
+    claims_transaction = any(word.lower() in lowered for word in TRANSACTION_CONTEXT_WORDS)
+    tx_match = TX_ID_PATTERN.search(text)
+    if claims_transaction:
+        if tx_match:
+            findings.append({
+                "type": "positive",
+                "text": f"ትክክለኛ ቅርጸት ያለው የግብይት መለያ ተገኝቷል ({tx_match.group().upper()})",
+            })
+        else:
+            risk += 15
+            findings.append({
+                "type": "negative",
+                "text": "የግብይት ጥያቄ ቢመስልም ትክክለኛ ቅርጸት ያለው Transaction ID አልተገኘም",
+            })
+
+    risk = min(max(risk, 0), 100)
+
+    if not findings:
+        findings.append({
+            "type": "positive",
+            "text": "ምንም የታወቀ የማጭበርበሪያ ምልክት አልተገኘም",
+        })
+
+    verdict = "ማጭበርበሪያ" if risk >= 50 else "እውነተኛ"
+    return {"risk": risk, "verdict": verdict, "findings": findings}
+
+
+# ---------------------------------------------------------------------------
+# SESSION STATE INITIALIZATION (robust across reruns)
+# ---------------------------------------------------------------------------
+if "sms_text" not in st.session_state:
+    st.session_state.sms_text = ""
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+if "ussd_screen" not in st.session_state:
+    st.session_state.ussd_screen = "home"
+
+
+def set_sample(sample_text: str):
+    st.session_state.sms_text = sample_text
+    st.session_state.last_result = None
+
+
+def run_analysis():
+    st.session_state.last_result = analyze_sms(st.session_state.sms_text)
+
+
+def goto(screen: str):
+    st.session_state.ussd_screen = screen
+
+
+def render_ussd_screen(content: str):
+    st.markdown(
+        f"""
+        <div class="ussd-phone">
+            <div class="ussd-header">📶 Ethio Telecom &nbsp;|&nbsp; 🔋 100%</div>
+            <div class="ussd-screen">{content}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HEADER
+# ---------------------------------------------------------------------------
+st.markdown(
+    """
+    <div class="main-header">
+        <h1>🛡️ Telebirr FraudShield</h1>
+        <p>የተንቀሳቃሽ ገንዘብ ልውውጥ ደህንነት ስርዓት — Offline &amp; USSD Hybrid Edition</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+tab1, tab2 = st.tabs([
+    "📱 ስማርት ስልክ — SMS መርማሪ",
+    "📟 ጠቅጠቅ ስልክ — USSD ማስመሰያ",
+])
+
+# ---------------------------------------------------------------------------
+# TAB 1 — SMARTPHONE SMS FORENSIC INSPECTOR
+# ---------------------------------------------------------------------------
 with tab1:
-    st.markdown("### የጽሁፍ መልእክት እና ኤስኤምኤስ ደህንነት ምርመራ")
-    
-    sample_real = "ብር 500.00 ከ ABEBE KEBEDE ተቀብለዋል። የግብይት ቁጥር: TR24AB789CD. ቀሪ ሂሳብዎ ብር 3,450.00 ነው."
-    sample_fake = "እንኳን ደስ አለዎት! 60 ሚሊዮን ብር አሸንፈዋልል። ሽልማቱን ለመቀበል የሚከተለውን ሊንክ ይጫኑ t.me/telebirr_free_gift ወዲያውኑ ይደውሉልን 0911223344"
+    st.subheader("የ SMS / ግብይት ጽሑፍ መርማሪ")
+    st.caption("አጠራጣሪ የ telebirr መልእክት ወይም ግብይት ማሳወቂያ ከታች ይለጥፉ እና ይመርምሩ።")
 
-    col_d1, col_d2 = st.columns(2)
-    demo_choice = ""
-    if col_d1.button("🟢 እውነተኛ ናሙና"):
-        demo_choice = sample_real
-    if col_d2.button("🔴 ሀሰተኛ ናሙና"):
-        demo_choice = sample_fake
+    demo_col1, demo_col2 = st.columns(2)
+    with demo_col1:
+        st.button(
+            "🟢 እውነተኛ ናሙና",
+            use_container_width=True,
+            on_click=set_sample,
+            args=(SAMPLE_REAL,),
+        )
+    with demo_col2:
+        st.button(
+            "🔴 ሀሰተኛ ናሙና",
+            use_container_width=True,
+            on_click=set_sample,
+            args=(SAMPLE_FAKE,),
+        )
 
-    user_input = st.text_area("የተጠራጠሩትን የቴሌብር ኤስኤምኤስ ወይም ጽሁፍ እዚህ ያስገቡ:", value=demo_choice, height=100)
+    st.text_area(
+        "የ SMS ጽሑፍ",
+        key="sms_text",
+        height=150,
+        placeholder="የ SMS ወይም የግብይት መልእክት እዚህ ይለጥፉ...",
+    )
 
-    def analyze_sms(text):
-        if not text.strip():
-            return None
-        score = 0
-        reasons = []
-        
-        scam_keywords = ['አሸንፈዋል', 'ሊንኩን', 'በነፃ', 'ሽልማት', 'ሊቀበሉ', 'ግዛ', 'ይደውሉ', 't.me/', 'http', 'bit.ly', 'won', 'free', 'congrats']
-        found_keywords = [kw for kw in scam_keywords if kw in text.lower()]
-        
-        if found_keywords:
-            score += 50
-            reasons.append(f"⚠️ አጠራጣሪ ቃላት ተገኝተዋል: {', '.join(found_keywords)}")
-        
-        phone_pattern = r'\b(09|07)\d{8}\b'
-        if re.search(phone_pattern, text):
-            score += 35
-            reasons.append("⚠️ መልእክቱ የተላከው ከተራ የሞባይል ስልክ ቁጥር ነው (ኦፊሴላዊ አጭር ቁጥር አይደለም)")
-        
-        trx_pattern = r'TR[A-Z0-9]{6,}'
-        if re.search(trx_pattern, text):
-            score -= 30
-            reasons.append("✅ ትክክለኛ የቴሌብር የግብይት መለያ ቁጥር (Transaction ID) ቅንብር ተገኝቷል")
-        else:
-            if "ብር" in text or "ተልኮ" in text:
-                score += 20
-                reasons.append("❌ መደበኛ የቴሌብር የግብይት መለያ ቁጥር (Transaction ID) አልተገኘም")
+    st.button("🔍 ተንትን (Analyze)", type="primary", on_click=run_analysis)
 
-        risk_percentage = min(max(score, 5), 98) if score > 0 else 5
-        verdict = "FAKE" if (found_keywords and (re.search(phone_pattern, text) or not re.search(trx_pattern, text))) or score >= 40 else "REAL"
-        if verdict == "REAL": 
-            risk_percentage = 2
+    result = st.session_state.last_result
+    if result is not None:
+        st.markdown("---")
+        metric_col, verdict_col = st.columns([1, 2])
+        with metric_col:
+            st.metric("የአደጋ መጠን (Risk Score)", f"{result['risk']}%")
+        with verdict_col:
+            if result["verdict"] == "እውነተኛ":
+                st.markdown(
+                    '<div class="verdict-safe">🟢 እውነተኛ መልእክት ሳይሆን አይቀርም</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="verdict-fraud">🔴 ሀሰተኛ / ማጭበርበሪያ መልእክት ነው</div>',
+                    unsafe_allow_html=True,
+                )
 
-        return verdict, risk_percentage, reasons
+        st.markdown("#### 📋 ዝርዝር ትንተና")
+        for finding in result["findings"]:
+            icon = "✅" if finding["type"] == "positive" else "⚠️"
+            st.markdown(f"- {icon} {finding['text']}")
 
-    if st.button("🔍 መልእክቱን መርምር", type="primary"):
-        if not user_input.strip():
-            st.warning("እባክዎ የሚመረመርውን ጽሁፍ ያስገቡ።")
-        else:
-            with st.spinner("ሲስተሙ መልእክቱን በመመርመር ላይ ነው..."):
-                verdict, risk, reasons = analyze_sms(user_input)
-                st.markdown("---")
-                col1, col2 = st.columns([1, 2])
-                with col1:
-                    st.metric(label="የአደጋ መጠን (Risk Score)", value=f"{risk}%")
-                with col2:
-                    if verdict == "REAL":
-                        st.success("🟢 **ውጤት: እውነተኛ የቴሌብር መልእክት**")
-                    else:
-                        st.error("🔴 **ውጤት: ማጭበርበሪያ / ሀሰተኛ መልእክት**")
-                
-                st.markdown("#### 🔎 የደህንነት ትንተና ዝርዝር:")
-                for r in reasons:
-                    st.markdown(f"- {r}")
-
+# ---------------------------------------------------------------------------
+# TAB 2 — FEATURE PHONE USSD SIMULATOR (*127#)
+# ---------------------------------------------------------------------------
 with tab2:
-    st.markdown("### የጠቅጠቅ ስልክ USSD ኮድ ማስመሰያ (*127#)")
-    st.markdown("ይህ ማሳያ በገጠር እና በጠቅጠቅ ስልክ ላሉ ተጠቃሚዎች ያለ ኢንተርኔት በUSSD የሚሰጠውን አገልግሎት ያስመስላል። ዳኞች ፊት ሲቀርቡ ለመጠቀም እጅግ ውብ አማራጭ ነው።")
-    
-    if 'ussd_step' not in st.session_state:
-        st.session_state.ussd_step = 'home'
+    st.subheader("የ USSD አገልግሎት ማስመሰያ")
+    st.caption(
+        "የበይነመረብ ግንኙነት ለሌላቸው የ feature phone ተጠቃሚዎች የተዘጋጀ ብሔራዊ አካታችነት ማሳያ።"
+    )
 
-    ussd_code = st.text_input("USSD ኮድ ይፃፉ (ለምሳሌ *127#):", value="*127#", key="ussd_field")
+    screen = st.session_state.ussd_screen
+    divider = "─" * 22
 
-    if ussd_code.strip() == "*127#":
-        st.markdown("<div class='ussd-screen'>", unsafe_allow_html=True)
-        if st.session_state.ussd_step == 'home':
-            st.markdown("<b>Telebirr FraudShield Menu:</b><br>1. የግብይት ቁጥር (TxID) አረጋግጥ<br>2. አጠራጣሪ SMS ሪፖርት አድርግ<br>3. የደህንነት ጠቃሚ ምክሮች", unsafe_allow_html=True)
-            choice = st.text_input("ምርጫዎን ያስገቡ (1, 2 ወይም 3):", key="menu_choice")
-            if st.button("ላክ (Send)", key="btn_send_home"):
-                if choice == '1':
-                    st.session_state.ussd_step = 'check_tx'
-                    st.rerun()
-                elif choice == '2':
-                    st.session_state.ussd_step = 'report_sms'
-                    st.rerun()
-                elif choice == '3':
-                    st.session_state.ussd_step = 'tips'
-                    st.rerun()
-        
-        elif st.session_state.ussd_step == 'check_tx':
-            st.markdown("<b>የግብይት ማረጋገጫ:</b><br>እባክዎ የግብይት ቁጥሩን (ለምሳሌ TR24AB78) ያስገቡ:", unsafe_allow_html=True)
-            tx_code = st.text_input("TxID:", key="tx_input")
-            if st.button("አረጋግጥ", key="btn_check"):
-                if tx_code.startswith("TR"):
-                    st.success("መልዕክት: 🟢 ይህ የግብይት ቁጥር ትክክለኛ ነው።")
-                else:
-                    st.error("መልዕክት: 🔴 ይህ ቁጥር ሀሰተኛ ወይም የተሳሳተ ነው!")
-            if st.button("ተመለስ (Back)", key="btn_back_1"):
-                st.session_state.ussd_step = 'home'
-                st.rerun()
-
-        elif st.session_state.ussd_step == 'report_sms':
-            st.markdown("<b>ማጭበርበር ሪፖርት ማድረጊያ:</b><br>አጠራጣሪውን ስልክ ቁጥር ወይም አጭር ጽሁፍ ያስገቡ:", unsafe_allow_html=True)
-            rep_text = st.text_input("ዝርዝር:", key="rep_input")
-            if st.button("ሪፖርት አድርግ", key="btn_report"):
-                st.success("አመሰግናለን! ሪፖርቱ ለኢትዮ ቴሌኮም ደህንነት ክፍል ተልኳል።")
-            if st.button("ተመለስ (Back)", key="btn_back_2"):
-                st.session_state.ussd_step = 'home'
-                st.rerun()
-
-        elif st.session_state.ussd_step == 'tips':
-            st.markdown("<b>የደህንነት ምክሮች:</b><br>- የይለፍ ቃልዎን (PIN) ለምንም ሰው አያጋሩ!<br>- በነፃ የሚሰጥ የውሸት ሽልማት አያምኑ።", unsafe_allow_html=True)
-            if st.button("ተመለስ (Back)", key="btn_back_3"):
-                st.session_state.ussd_step = 'home'
-                st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+    if screen == "home":
+        content = (
+            f"*127#\n{divider}\nTelebirr FraudShield\n{divider}\n"
+            "1. የግብይት ማረጋገጫ\n"
+            "2. አጠራጣሪ መልእክት ሪፖርት\n"
+            "3. የደህንነት ምክሮች\n"
+            "0. ውጣ\n"
+            f"{divider}\nምላሽዎን ይላኩ..."
+        )
+    elif screen == "check_tx":
+        content = (
+            f"*127*1#\n{divider}\nየግብይት ማረጋገጫ\n{divider}\n"
+            "የግብይት መለያ ቁጥርዎን\n(Transaction ID) ያስገቡ:\n"
+            f"{divider}"
+        )
+    elif screen == "check_tx_result":
+        raw_tx = st.session_state.get("ussd_tx_input_value", "") or ""
+        tx_clean = raw_tx.strip().upper()
+        is_valid = bool(TX_ID_PATTERN.fullmatch(tx_clean)) if tx_clean else False
+        safe_tx = html.escape(tx_clean) if tx_clean else "—"
+        if is_valid:
+            content = (
+                f"*127*1#\n{divider}\n✔ ውጤት\n{divider}\n"
+                f"መለያ: {safe_tx}\nትክክለኛ ቅርጸት አለው።\n\n"
+                "ሙሉ ማረጋገጫ ለማግኘት\n127 ይደውሉ።\n"
+                f"{divider}"
+            )
+        else:
+            content = (
+                f"*127*1#\n{divider}\n✘ ውጤት\n{divider}\n"
+                f"መለያ: {safe_tx}\nትክክለኛ የ telebirr\nቅርጸት የለውም። ይጠንቀቁ!\n"
+                f"{divider}"
+            )
+    elif screen == "report_sms":
+        content = (
+            f"*127*2#\n{divider}\nአጠራጣሪ መልእክት ሪፖርት\n{divider}\n"
+            "የመልእክቱን ይዘት ከታች\nያስገቡና ይላኩ\n"
+            f"{divider}"
+        )
+    elif screen == "report_done":
+        content = (
+            f"*127*2#\n{divider}\n✔ ሪፖርትዎ ደርሶናል\n{divider}\n"
+            "እናመሰግናለን! የ telebirr\nደህንነት ቡድን ጉዳዩን\nይመረምራል።\n"
+            f"{divider}"
+        )
+    elif screen == "tips":
+        content = (
+            f"*127*3#\n{divider}\nየደህንነት ምክሮች\n{divider}\n"
+            "• ፒንዎን ለማንም አይንገሩ\n"
+            "• ያልታወቀ ሊንክ አይንኩ\n"
+            "• ሽልማት የሚል መልእክት\n  ሲመጣ ይጠንቀቁ\n"
+            "• ግብይት ሁሌም በ127\n  ያረጋግጡ\n"
+            f"{divider}"
+        )
+    elif screen == "exit":
+        content = (
+            f"*127#\n{divider}\nክፍለ ጊዜው ተጠናቋል\n{divider}\n"
+            "telebirr FraudShield\nን ስለተጠቀሙ\nእናመሰግናለን።\n"
+            f"{divider}"
+        )
     else:
-        st.info("እባክዎ ትክክለኛውን የUSSD ኮድ `*127#` ብለው ያስገቡ።")
+        screen = "home"
+        content = (
+            f"*127#\n{divider}\nTelebirr FraudShield\n{divider}\n"
+            "1. የግብይት ማረጋገጫ\n2. አጠራጣሪ መልእክት ሪፖርት\n3. የደህንነት ምክሮች\n0. ውጣ\n"
+            f"{divider}\nምላሽዎን ይላኩ..."
+        )
 
-# Footer Note
+    render_ussd_screen(content)
+
+    if screen == "home":
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.button("1️⃣ ግብይት", use_container_width=True, on_click=goto, args=("check_tx",))
+        with c2:
+            st.button("2️⃣ ሪፖርት", use_container_width=True, on_click=goto, args=("report_sms",))
+        with c3:
+            st.button("3️⃣ ምክሮች", use_container_width=True, on_click=goto, args=("tips",))
+        with c4:
+            st.button("0️⃣ ውጣ", use_container_width=True, on_click=goto, args=("exit",))
+
+    elif screen == "check_tx":
+        st.text_input(
+            "Transaction ID",
+            key="ussd_tx_input_value",
+            placeholder="ለምሳሌ TR251A8B9C21",
+            label_visibility="collapsed",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.button("✅ ላክ", use_container_width=True, on_click=goto, args=("check_tx_result",))
+        with c2:
+            st.button("🔙 ተመለስ", use_container_width=True, on_click=goto, args=("home",))
+
+    elif screen == "check_tx_result":
+        st.button("🔙 ወደ ዋና ማውጫ ተመለስ", use_container_width=True, on_click=goto, args=("home",))
+
+    elif screen == "report_sms":
+        st.text_area(
+            "የመልእክት ይዘት",
+            key="ussd_report_text",
+            height=100,
+            label_visibility="collapsed",
+            placeholder="አጠራጣሪ መልእክቱን እዚህ ይለጥፉ...",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.button("✅ ላክ", use_container_width=True, on_click=goto, args=("report_done",))
+        with c2:
+            st.button("🔙 ተመለስ", use_container_width=True, on_click=goto, args=("home",))
+
+    elif screen == "report_done":
+        st.button("🔙 ወደ ዋና ማውጫ ተመለስ", use_container_width=True, on_click=goto, args=("home",))
+
+    elif screen == "tips":
+        st.button("🔙 ወደ ዋና ማውጫ ተመለስ", use_container_width=True, on_click=goto, args=("home",))
+
+    elif screen == "exit":
+        st.button("🔄 እንደገና ጀምር (*127#)", use_container_width=True, on_click=goto, args=("home",))
+
+# ---------------------------------------------------------------------------
+# FOOTER
+# ---------------------------------------------------------------------------
 st.markdown("---")
-st.markdown("<p style='font-size:11px; color:gray;'>Ethio Telecom Competition - Telebirr FraudShield AI (Offline & USSD Supported)</p>", unsafe_allow_html=True)
+st.caption(
+    "🔒 ይህ መተግበሪያ ለ Ethio Telecom Innovation Challenge የቀረበ ማሳያ ስሪት ነው። "
+    "ትንተናው ሙሉ በሙሉ በአካባቢያዊ (local) rule-based logic ላይ የተመሰረተ ነው።"
+)
