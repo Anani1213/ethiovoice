@@ -172,8 +172,8 @@ if analyze_clicked:
                 st.markdown(analysis_text)
                 st.markdown("</div>", unsafe_allow_html=True)
 
-            except Exception:
-                st.error(GENERIC_ERROR_MESSAGE)
+            except Exception as e:
+                st.error(f"የምስል ምርመራው ላይ ጊዜያዊ ችግር አጋጥሟል... Debug Info: {str(e)}")
 
 st.markdown("---")
 st.caption(
