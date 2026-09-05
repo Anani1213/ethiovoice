@@ -8,6 +8,7 @@ Run with: streamlit run app.py
 
 import streamlit as st
 import os
+import re
 from PIL import Image
 
 try:
@@ -58,37 +59,66 @@ def _get_backend_key():
 _BACKEND_KEY = _get_backend_key()
 SYSTEM_READY = bool(_BACKEND_KEY) and SDK_AVAILABLE
 
-_model = None
 if SYSTEM_READY:
     try:
         genai.configure(api_key=_BACKEND_KEY)
-        _model = genai.GenerativeModel('gemini-1.5-flash')
     except Exception:
         SYSTEM_READY = False
-        _model = None
+
+# Tried in order; if one name 404s or is otherwise unavailable for this
+# account/key/API version, the next is used automatically. Never shown
+# in the UI, and cached per session once a working one is found.
+_MODEL_CANDIDATES = [
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro",
+    "gemini-pro-vision",
+]
+
+if "working_model" not in st.session_state:
+    st.session_state.working_model = None
 
 FORENSIC_SYSTEM_PROMPT = (
-    "You are an expert Telebirr forensic transaction analyzer. Inspect this "
-    "receipt screenshot for photoshopped edits, inconsistent fonts, "
-    "misaligned numbers, or altered transaction IDs. Respond ONLY in Amharic "
-    "with: 1) Verdict (🟢 እውነተኛ የቴሌብር ደረሰኝ / 🔴 የትስስር/የተቀየረ ሀሰተኛ ደረሰኝ), "
+    "You are an expert Telebirr forensic analyzer. Inspect this receipt "
+    "screenshot for photoshopped edits, inconsistent fonts, misaligned "
+    "numbers, or altered transaction IDs. Respond ONLY in Amharic with: "
+    "1) Verdict (🟢 እውነተኛ የቴሌብር ደረሰኝ / 🔴 የትስስር/የተቀየረ ሀሰተኛ ደረሰኝ), "
     "2) Fraud Risk Score (0-100%), and 3) Detailed Bulleted Reasons."
 )
 
-GENERIC_ERROR_MESSAGE = (
-    "የምስል ምርመራው ላይ ጊዜያዊ ችግር አጋጥሟል፤ እባክዎ ምስሉ ግልጽ መሆኑን አረጋግጠው ድጋሚ ይሞክሩ።"
-)
+
+def _build_model_order():
+    """Try whichever model last worked first, then the rest of the list."""
+    working = st.session_state.get("working_model")
+    if working and working in _MODEL_CANDIDATES:
+        return [working] + [m for m in _MODEL_CANDIDATES if m != working]
+    return list(_MODEL_CANDIDATES)
 
 
 def _analyze_receipt(uploaded_file):
     """
     Sends the receipt image, alongside the forensic prompt, to the backend
-    for analysis. Any failure is raised up to the caller, which shows one
-    clean Amharic error message with no technical detail exposed.
+    for analysis. Loops through _MODEL_CANDIDATES in order; a model that
+    throws (404, deprecated name, etc.) is skipped in favor of the next one.
+    Stops as soon as one succeeds. Raises the last error only if every
+    candidate fails.
     """
     image = Image.open(uploaded_file)
-    response = _model.generate_content([FORENSIC_SYSTEM_PROMPT, image])
-    return response.text.strip()
+
+    last_error = None
+    for model_name in _build_model_order():
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content([FORENSIC_SYSTEM_PROMPT, image])
+            st.session_state.working_model = model_name
+            return response.text.strip()
+        except Exception as e:
+            last_error = e
+            if st.session_state.get("working_model") == model_name:
+                st.session_state.working_model = None
+            continue
+
+    raise last_error if last_error is not None else RuntimeError("Analysis unavailable")
 
 
 def _parse_verdict_and_score(analysis_text):
@@ -97,7 +127,6 @@ def _parse_verdict_and_score(analysis_text):
     score (0-100) from the free-form Amharic analysis text, for the
     st.metric summary cards.
     """
-    import re
     score_match = re.search(r"(\d{1,3})\s*%", analysis_text)
     score = None
     if score_match:
@@ -173,7 +202,7 @@ if analyze_clicked:
                 st.markdown("</div>", unsafe_allow_html=True)
 
             except Exception as e:
-                st.error(f"የምስል ምርመራው ላይ ጊዜያዊ ችግር አጋጥሟል... Debug Info: {str(e)}")
+                st.error(f"የምስል ምርመራው ላይ ጊዜያዊ ችግር አጋጥሟል... Debug: {str(e)}")
 
 st.markdown("---")
 st.caption(
